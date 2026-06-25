@@ -20,4 +20,5 @@ scripts/opjstyle*
 # metal-t1-gpu experiment: build artifacts, generated corpus, and large test media
 /build/
 /proto/corpus.bin
+/proto/dwt_corpus.bin
 /tests/test-content/

@@ -4071,9 +4071,48 @@ OPJ_BOOL opj_dwt_decode_real(opj_tcd_t *p_tcd,
                              opj_tcd_tilecomp_t* OPJ_RESTRICT tilec,
                              OPJ_UINT32 numres)
 {
-    if (p_tcd->whole_tile_decoding) {
-        return opj_dwt_decode_tile_97(p_tcd->thread_pool, tilec, numres);
-    } else {
-        return opj_dwt_decode_partial_97(tilec, numres);
+    /* --- metal-jpeg2000 inverse-DWT corpus dump (env-gated, prototype only) --- */
+    /* OPJ_DWT_DUMP=<path> + decode -threads 1 emits per tile-component the
+     * resolution geometry, input float buffer, and output float buffer (oracle)
+     * for the Metal inverse 9/7 DWT prototype. Whole-tile (DCI) path only. */
+    static FILE* s_dwt_dump = NULL;
+    static int s_dwt_init = 0;
+    OPJ_UINT32 dwt_w = 0, dwt_h = 0;
+    if (!s_dwt_init) {
+        const char* p = getenv("OPJ_DWT_DUMP");
+        if (p) { s_dwt_dump = fopen(p, "wb"); }
+        s_dwt_init = 1;
     }
+    if (s_dwt_dump && p_tcd->whole_tile_decoding && numres >= 1) {
+        opj_tcd_resolution_t* rr = &tilec->resolutions[numres - 1];
+        OPJ_UINT32 magic = 0x31545744; /* 'DWT1' */
+        OPJ_UINT32 r;
+        dwt_w = (OPJ_UINT32)(rr->x1 - rr->x0);
+        dwt_h = (OPJ_UINT32)(rr->y1 - rr->y0);
+        fwrite(&magic, 4, 1, s_dwt_dump);
+        fwrite(&numres, 4, 1, s_dwt_dump);
+        for (r = 0; r < numres; ++r) {
+            OPJ_INT32 box[4];
+            box[0] = tilec->resolutions[r].x0; box[1] = tilec->resolutions[r].y0;
+            box[2] = tilec->resolutions[r].x1; box[3] = tilec->resolutions[r].y1;
+            fwrite(box, 4, 4, s_dwt_dump);
+        }
+        fwrite(&dwt_w, 4, 1, s_dwt_dump);
+        fwrite(&dwt_h, 4, 1, s_dwt_dump);
+        fwrite(tilec->data, sizeof(OPJ_INT32), (size_t)dwt_w * dwt_h, s_dwt_dump); /* input */
+    }
+    /* --- END dump (input) --- */
+
+    OPJ_BOOL ret;
+    if (p_tcd->whole_tile_decoding) {
+        ret = opj_dwt_decode_tile_97(p_tcd->thread_pool, tilec, numres);
+    } else {
+        ret = opj_dwt_decode_partial_97(tilec, numres);
+    }
+
+    if (s_dwt_dump && p_tcd->whole_tile_decoding && numres >= 1) {
+        fwrite(tilec->data, sizeof(OPJ_INT32), (size_t)dwt_w * dwt_h, s_dwt_dump); /* output oracle */
+        fflush(s_dwt_dump);
+    }
+    return ret;
 }

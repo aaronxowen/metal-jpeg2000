@@ -411,3 +411,48 @@ P-cores onto the idle GPU** while the back-end (DWT/MCT/level-shift/xyz_to_rgb) 
 realistic path to M1 2K realtime: GPU back-end + GPU color first (large, easy), then GPU T1 with
 threadgroup-memory optimization if profiling on the M1 still shows a gap. 4K/HFR will need the
 optimized GPU T1.
+
+---
+
+## 13. GPU back-end: inverse 9/7 DWT (done — float-exact)
+
+Same methodology as T1. Corpus dump added to `opj_dwt_decode_real` (`OPJ_DWT_DUMP=<path>`, `-threads 1`):
+per tile-component it emits resolution geometry + input float buffer + output float buffer (oracle).
+
+- `proto/dwt_ref.c` — scalar port of `opj_dwt_decode_tile_97` / `opj_v8dwt_decode` (NB_ELTS=1), the
+  6-step lifting incl. the deliberate `two_invK` quirk. Build with `-ffp-contract=off` (matches the
+  non-fused NEON `vmlaq_f32`). Max abs diff vs oracle 0.0045 (FP-order noise; rounds to same int image).
+- `proto/dwt_kernel.metal` + `proto/dwt_bench.swift` — Metal kernel: 1 thread per row (H pass) / per
+  column (V pass); barrier between H/V and between levels (separate encoders in one command buffer).
+  Compiled with fast-math **off** → GPU output is **float-exact** vs the oracle (max abs diff 0.0).
+
+```
+GPU: Apple M5 Pro  ... 3 components, 6 res levels each
+records: 3  coeffs: 6473520  differ: 0  max abs diff: 0.0   <- FLOAT-EXACT
+GPU iDWT: 12.65 ms/frame (4.22 ms/component)
+```
+
+| Inverse 9/7 DWT (frame, 3 comp) | Time | |
+|---|---|---|
+| scalar C reference | 22.4 ms | no SIMD |
+| GPU Metal kernel | 12.7 ms | float-exact, **unoptimized** |
+| OpenJPEG CPU (NEON, ≈18% of 53 ms) | ~9.4 ms | already vectorized |
+
+### Key finding — the DWT is NOT a clear GPU win on a strong-CPU Mac
+
+Unlike T1, the inverse DWT is memory-bandwidth-bound and OpenJPEG's CPU path is already
+NEON-vectorized, so the unoptimized GPU kernel (per-thread device-memory scratch, uncoalesced
+gather/scatter, 10 dispatches/frame) **loses to the M5 Pro CPU**. Implications:
+
+- The DWT's GPU value is **machine-dependent**: it pays off on the weak-CPU **M1** and, more
+  importantly, by **freeing the 4 P-cores for T1** — not as a raw speedup on strong Macs.
+- Kernel headroom: threadgroup-memory tiling, fuse gather/scatter (avoid the separate interleaved
+  buffer), batch all 3 components into one dispatch, fewer/larger dispatches.
+- **Re-prioritization:** the bigger *easy* CPU-relief win is likely **`xyz_to_rgb`** (libdcp does it
+  on CPU, per-pixel `pow`, **not** NEON-optimized) — a better next target than further DWT tuning.
+
+### Correctness milestone
+
+Both GPU stages built so far — **T1 (bit-exact) and inverse DWT (float-exact)** — validate against
+OpenJPEG. The methodology (corpus + oracle + scalar reference + Metal kernel) is proven and reusable
+for the remaining back-end stages (inverse MCT/ICT, level-shift, xyz_to_rgb).
