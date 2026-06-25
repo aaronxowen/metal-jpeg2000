@@ -29,10 +29,10 @@ back-end and *freeing CPU cores*, not the bottleneck itself. This reframes the o
 JPEG 2000" instinct: the win is load-balancing across two processors, not raw GPU throughput.
 
 **Realtime verdict:**
-- **2K@24 on the M1: ACHIEVED (empirically).** The Phase A overlapped hybrid harness measures
-  **41.3 ms/frame (24.2 fps), integer-exact**, on the M1 — meeting the 41.6 ms budget. Margin is thin
-  (0.3 ms), but the bottleneck is the **unoptimized GPU back-end (38.5 ms)** while CPU T1 overlaps
-  comfortably at **19 ms** — i.e. headroom is in a stage we know how to optimize. See §17.
+- **2K@24 on the M1: ACHIEVED (empirically), with comfortable margin.** The Phase A overlapped hybrid
+  harness measures **34.6 ms/frame (28.9 fps), integer-exact**, on the M1 after a first back-end
+  optimization (component-batching) — **7.0 ms margin** over the 41.6 ms budget (was 0.3 ms before opt).
+  Still GPU-bound (back-end 32.5 ms vs CPU T1 19 ms). See §17–18.
 - **4K / HFR: out of reach** this way (≈4× the work on both sides).
 - Guaranteed fallback: `reduce=1` decode (skip finest DWT level, ~75% less T1 work) with quality cost.
 
@@ -649,3 +649,38 @@ independent and unaffected.
 - 2K@24 is the target and it passes; 4K/HFR remain out of reach (≈4× both sides).
 - The core feasibility question is now answered **empirically and affirmatively**. Remaining work is
   back-end kernel optimization (for margin) and player integration (Phase C).
+
+---
+
+## 18. Phase A back-end optimization #1 (component-batching) — M1 result
+
+First post-decision-gate optimization: concatenate the 3 components and batch them into single
+inverse-DWT H/V dispatches (`proto/phase_a/backend_opt.metal`) — ~30→~10 dispatches, 3× threads per
+dispatch. Per-line lifting math unchanged → still **integer-exact**.
+
+| GPU back-end (per frame) | M5 Pro | M1 |
+|---|---|---|
+| original | 14.1 ms | 38.5 ms |
+| component-batched | 8.4 ms (**1.68×**) | 32.5 ms (**1.18×**) |
+
+| Overlapped hybrid (M1) | before | after |
+|---|---|---|
+| ms/frame · fps | 41.3 · 24.2 | **34.6 · 28.9** |
+| margin over 41.6 ms | 0.3 ms | **7.0 ms** |
+| validation | exact | **integer-exact** |
+
+### Why the M1 gained less (1.18×) than the M5 Pro (1.68×)
+Batching cuts dispatch overhead and raises occupancy, but **not** total device-memory traffic. The M1's
+small GPU is **bandwidth-bound**, and the per-thread DWT working buffer (`Wpool`) lives in device
+memory — every lifting sub-pass streams it through DRAM. So the M1 win is occupancy-limited. The next
+lever, if more margin is wanted, is **threadgroup-memory scratch** for the 1-D line (lifting hits
+on-chip memory; only the initial gather + final scatter touch DRAM) — that targets bandwidth directly
+and should help the M1 more than batching did. Deferred: 7 ms margin is already comfortable for 2K@24.
+
+### Status
+2K@24 realtime on the M1 is met with ~7 ms headroom, integer-exact. The harness still outputs XYZ
+(no `xyz_to_rgb` yet); since the pipeline is GPU-bound with CPU T1 idle ~14 ms/frame, color belongs on
+the **CPU slack**, not the GPU. Remaining margin must also absorb real-player overheads (distinct-frame
+decode vs the harness's warm same-frame loop, MXF read + AES decrypt, display, A/V sync) — to be
+measured in Phase C. Recommendation: stop micro-optimizing the back-end now and proceed to Phase C
+(player integration), optimizing in situ against real overheads.
