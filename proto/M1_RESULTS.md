@@ -111,3 +111,24 @@ Per-frame time = `max(CPU T1, GPU back-end)`. 120-frame run on real DCI 2K conte
 | **MEETS 24fps budget (41.6 ms)?** | **YES ✓** |
 
 The hybrid delivers 2K realtime on the M1. The GPU back-end is the bottleneck; CPU T1 finishes well inside it at 19 ms. Margin over budget is 0.3 ms — thin but passing. (M5 Pro reference: ~20 ms/frame, ~49 fps.)
+
+---
+
+## Phase A optimized back-end (M1) — 2026-06-25
+
+Component-batching optimization applied to the GPU back-end kernel. 120-frame run on real DCI 2K content.
+
+| Metric | Value |
+|---|---|
+| **Optimized GPU back-end (Step 4)** | **32.502 ms/frame** |
+| vs earlier 38.520 ms | **1.18× faster** |
+| CPU decode-to-T1 calibration | 19.195 ms/frame |
+| GPU back-end calibration (Step 3) | 33.939 ms/frame |
+| Critical path `max(CPU, GPU)` | 33.939 ms (GPU-bound) |
+| **Overlapped hybrid ms/frame** | **34.608 ms** |
+| **fps** | **28.9 fps** |
+| Validation | **INTEGER-EXACT vs oracle ✓** |
+| **MEETS 24fps budget (41.6 ms)?** | **YES ✓** |
+| Margin | **7.0 ms** (vs 0.3 ms before) |
+
+The back-end optimization adds 7.0 ms of margin over the 41.6 ms budget, up from 0.3 ms. The pipeline is now comfortably GPU-bound at 33.9 ms with CPU T1 idle for ~14 ms of each frame interval.
