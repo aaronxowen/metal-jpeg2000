@@ -108,12 +108,23 @@ swiftc -O proto/phase_a/hybrid_harness.swift \
   -framework Metal -framework Foundation -o /tmp/hybrid_harness
 
 FRAME=path/to/2K-Flat_ProRes422_StereoVF_000000.j2c
-/tmp/hybrid_harness "$FRAME" proto/backend_kernel.metal 120 proto/backend_corpus.bin
+/tmp/hybrid_harness "$FRAME" proto/phase_a/backend_opt.metal 120 proto/backend_corpus.bin
 ```
 
 **Report:** the `OVERLAPPED hybrid` ms/frame + fps, the CPU/GPU calibration split, whether VALIDATION
 is integer-exact, and whether it MEETS 24fps. This is the number that decides whether the hybrid
-delivers realtime 2K on the M1. (M5 Pro reference: ~20 ms/frame, ~49 fps, integer-exact.)
+delivers realtime 2K on the M1. (M5 Pro reference: ~22 ms/frame, ~46 fps, integer-exact.)
+
+### Optimized back-end (component-batched) — also measure this in isolation
+The hybrid command above now uses the OPTIMIZED back-end (`proto/phase_a/backend_opt.metal`: 3
+components batched into single H/V dispatches; integer-exact). To see the back-end speedup directly:
+```sh
+swiftc -O proto/phase_a/backend_opt_bench.swift -o /tmp/backend_opt_bench -framework Metal -framework Foundation
+/tmp/backend_opt_bench proto/backend_corpus.bin proto/phase_a/backend_opt.metal
+```
+Report the `OPTIMIZED GPU back-end` ms/frame and compare to the earlier `/tmp/backend_bench` number
+(M1 was ~38.5 ms; M5 Pro went 14.1 → 8.4 ms, ~1.7×). On the M1 the back-end was the binding stage, so
+this drop should widen the hybrid's margin substantially.
 
 ## Regenerating corpora (only if the corpus files are missing)
 The corpora are derived from one real DCI 2K frame via env-gated dumps in the (committed) instrumented

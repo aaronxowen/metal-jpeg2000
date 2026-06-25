@@ -26,8 +26,8 @@ struct FinalizeParams { var n: UInt32 = 0; var mct: Int32 = 0
     var hi = (Int32(0),Int32(0),Int32(0),Int32(0)) }
 
 final class Slot {
-    var comp: [MTLBuffer] = []   // nc float buffers (post-T1, iDWT runs in place)
-    var out:  [MTLBuffer] = []   // nc int buffers (final image)
+    var comp: MTLBuffer!   // nc components concatenated (post-T1 floats; iDWT in place)
+    var out:  MTLBuffer!   // nc components concatenated (final image ints)
 }
 
 final class HybridDecoder {
@@ -53,9 +53,9 @@ final class HybridDecoder {
         guard let ksrc = try? String(contentsOfFile: kernelPath, encoding: .utf8) else { die("read kernel") }
         let opts = MTLCompileOptions(); opts.fastMathEnabled = false
         guard let lib = try? d.makeLibrary(source: ksrc, options: opts) else { die("compile kernel") }
-        psoH = try! d.makeComputePipelineState(function: lib.makeFunction(name: "idwt97_h")!)
-        psoV = try! d.makeComputePipelineState(function: lib.makeFunction(name: "idwt97_v")!)
-        psoF = try! d.makeComputePipelineState(function: lib.makeFunction(name: "backend_finalize")!)
+        psoH = try! d.makeComputePipelineState(function: lib.makeFunction(name: "idwt97_h_b")!)
+        psoV = try! d.makeComputePipelineState(function: lib.makeFunction(name: "idwt97_v_b")!)
+        psoF = try! d.makeComputePipelineState(function: lib.makeFunction(name: "finalize_b")!)
         queue = d.makeCommandQueue()!
     }
 
@@ -73,9 +73,10 @@ final class HybridDecoder {
             ready = true
         }
         let slot = slots[fillSlot]
+        let base = slot.comp.contents()
         for c in 0..<nc {
             if let src = info.comp_data[c] {
-                memcpy(slot.comp[c].contents(), src, n * MemoryLayout<Int32>.size)
+                memcpy(base + c * n * MemoryLayout<Int32>.size, src, n * MemoryLayout<Int32>.size)
             }
         }
     }
@@ -83,11 +84,11 @@ final class HybridDecoder {
     func allocate() {
         let stride = max(w, h)
         boxBuf = boxes.withUnsafeBytes { dev.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)! }
-        wpool = dev.makeBuffer(length: stride*stride*4, options: .storageModePrivate)!
+        wpool = dev.makeBuffer(length: nc*stride*stride*4, options: .storageModePrivate)!
         for _ in 0..<2 {
             let s = Slot()
-            for _ in 0..<nc { s.comp.append(dev.makeBuffer(length: n*4, options: .storageModeShared)!) }
-            for _ in 0..<nc { s.out.append(dev.makeBuffer(length: n*4, options: .storageModeShared)!) }
+            s.comp = dev.makeBuffer(length: nc*n*4, options: .storageModeShared)!
+            s.out  = dev.makeBuffer(length: nc*n*4, options: .storageModeShared)!
             slots.append(s)
         }
         fp.n = UInt32(n); fp.mct = mct
@@ -101,26 +102,25 @@ final class HybridDecoder {
     func encodeBackend(_ slotIdx: Int) -> MTLCommandBuffer {
         let s = slots[slotIdx]
         let cb = queue.makeCommandBuffer()!
-        var wv = UInt32(w); let stride = max(w, h)
-        for c in 0..<nc {
-            for lvl in 1..<numres {
-                let x0 = Int(boxes[lvl*4+0]), y0 = Int(boxes[lvl*4+1])
-                let rw = Int(boxes[lvl*4+2]) - x0, rh = Int(boxes[lvl*4+3]) - y0
-                var lv = UInt32(lvl); var ws = UInt32(stride)
-                let eh = cb.makeComputeCommandEncoder()!; eh.setComputePipelineState(psoH)
-                eh.setBuffer(s.comp[c], offset:0, index:0); eh.setBuffer(boxBuf, offset:0, index:1); eh.setBuffer(wpool, offset:0, index:2)
-                eh.setBytes(&wv,length:4,index:3); eh.setBytes(&lv,length:4,index:4); eh.setBytes(&ws,length:4,index:5)
-                eh.dispatchThreads(MTLSize(width:rh,height:1,depth:1), threadsPerThreadgroup:MTLSize(width:min(64,psoH.maxTotalThreadsPerThreadgroup),height:1,depth:1)); eh.endEncoding()
-                let ev = cb.makeComputeCommandEncoder()!; ev.setComputePipelineState(psoV)
-                ev.setBuffer(s.comp[c], offset:0, index:0); ev.setBuffer(boxBuf, offset:0, index:1); ev.setBuffer(wpool, offset:0, index:2)
-                ev.setBytes(&wv,length:4,index:3); ev.setBytes(&lv,length:4,index:4); ev.setBytes(&ws,length:4,index:5)
-                ev.dispatchThreads(MTLSize(width:rw,height:1,depth:1), threadsPerThreadgroup:MTLSize(width:min(64,psoV.maxTotalThreadsPerThreadgroup),height:1,depth:1)); ev.endEncoding()
-            }
+        var wv = UInt32(w); let stride = max(w, h); var cs = UInt32(n)
+        for lvl in 1..<numres {
+            let x0 = Int(boxes[lvl*4+0]), y0 = Int(boxes[lvl*4+1])
+            let rw = Int(boxes[lvl*4+2]) - x0, rh = Int(boxes[lvl*4+3]) - y0
+            var lv = UInt32(lvl); var ws = UInt32(stride); var rhv = UInt32(rh); var rwv = UInt32(rw)
+            let eh = cb.makeComputeCommandEncoder()!; eh.setComputePipelineState(psoH)
+            eh.setBuffer(s.comp, offset:0, index:0); eh.setBuffer(boxBuf, offset:0, index:1); eh.setBuffer(wpool, offset:0, index:2)
+            eh.setBytes(&wv,length:4,index:3); eh.setBytes(&lv,length:4,index:4); eh.setBytes(&ws,length:4,index:5)
+            eh.setBytes(&cs,length:4,index:6); eh.setBytes(&rhv,length:4,index:7)
+            eh.dispatchThreads(MTLSize(width:nc*rh,height:1,depth:1), threadsPerThreadgroup:MTLSize(width:min(64,psoH.maxTotalThreadsPerThreadgroup),height:1,depth:1)); eh.endEncoding()
+            let ev = cb.makeComputeCommandEncoder()!; ev.setComputePipelineState(psoV)
+            ev.setBuffer(s.comp, offset:0, index:0); ev.setBuffer(boxBuf, offset:0, index:1); ev.setBuffer(wpool, offset:0, index:2)
+            ev.setBytes(&wv,length:4,index:3); ev.setBytes(&lv,length:4,index:4); ev.setBytes(&ws,length:4,index:5)
+            ev.setBytes(&cs,length:4,index:6); ev.setBytes(&rwv,length:4,index:7)
+            ev.dispatchThreads(MTLSize(width:nc*rw,height:1,depth:1), threadsPerThreadgroup:MTLSize(width:min(64,psoV.maxTotalThreadsPerThreadgroup),height:1,depth:1)); ev.endEncoding()
         }
         let ef = cb.makeComputeCommandEncoder()!; ef.setComputePipelineState(psoF)
-        for c in 0..<nc { ef.setBuffer(s.comp[c], offset:0, index:c) }
-        for c in 0..<nc { ef.setBuffer(s.out[c], offset:0, index:3+c) }
-        ef.setBytes(&fp, length: MemoryLayout<FinalizeParams>.stride, index:6)
+        ef.setBuffer(s.comp, offset:0, index:0); ef.setBuffer(s.out, offset:0, index:1)
+        ef.setBytes(&fp, length: MemoryLayout<FinalizeParams>.stride, index:2); ef.setBytes(&cs,length:4,index:3)
         ef.dispatchThreads(MTLSize(width:n,height:1,depth:1), threadsPerThreadgroup:MTLSize(width:min(256,psoF.maxTotalThreadsPerThreadgroup),height:1,depth:1)); ef.endEncoding()
         return cb
     }
@@ -209,9 +209,9 @@ if let op = oraclePath, let data = FileManager.default.contents(atPath: op) {
     let outBytes = ctx.nc * ctx.n * 4
     var off = bytes.count - outBytes
     var diff = 0
+    let p = ctx.slots[0].out.contents().bindMemory(to: Int32.self, capacity: ctx.nc * ctx.n)
     for c in 0..<ctx.nc {
-        let p = ctx.slots[0].out[c].contents().bindMemory(to: Int32.self, capacity: ctx.n)
-        for i in 0..<ctx.n { if p[i] != Int32(bitPattern: u32(off + 4*i)) { diff += 1 } }
+        for i in 0..<ctx.n { if p[c*ctx.n + i] != Int32(bitPattern: u32(off + 4*i)) { diff += 1 } }
         off += ctx.n*4
     }
     print(diff == 0 ? "VALIDATION: integer-exact vs oracle ✓" : "VALIDATION: \(diff) samples differ ✗")
