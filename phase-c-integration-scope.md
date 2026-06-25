@@ -48,22 +48,31 @@ Per-frame time ≈ `max(CPU T1, GPU back-end+color)`, overlapped frame N+1 ‖ f
 ## Build / link integration — the principal risk
 
 The app **bundles opj inside libdcp** and does not link `openjp2` separately. To use our fork's
-decode-to-T1 API in the Swift decoder, choose one:
+decode-to-T1 API in the Swift decoder, the options were:
 
-- **(a) Link our fork statically into the Swift target**, symbol-isolated (`-fvisibility=hidden`, or a
-  thin renamed C shim) so its `opj_*` symbols do not clash with libdcp's bundled opj. Lighter; needs
-  symbol hygiene.
-- **(b) Rebuild the Engine stack (libdcp + dcpomatic) against our opj fork** → one opj everywhere with
-  the API. Cleanest semantically; heavier build. The Engine already builds dcpomatic from source
-  (`-I …/dcpomatic/src`), so feasible.
+- (a) Link our fork statically into the Swift target, symbol-isolated.
+- (b) Rebuild the Engine stack (libdcp + dcpomatic) against our opj fork.
 
-Recommendation: start with **(a)** for Phase C prototyping (isolates blast radius), consider (b) for
-the eventual product build. **Resolve this first (C0)** — it gates everything.
+**DECISION (chosen): option (b)** — rebuild libdcp + dcpomatic against the `metal-jpeg2000` opj fork so
+there is **one opj everywhere**, carrying the decode-to-T1 API. No symbol clash (single copy); libdcp's
+own `decompress_j2k` and our Swift decoder share the same opj. Cleanest semantically.
+
+Implications to plan for (C0):
+- Build the fork's `libopenjp2` (+ headers), point **libdcp**'s build at it instead of the
+  system/Homebrew openjpeg, rebuild libdcp, then rebuild **dcpomatic** (links libdcp). Replace the
+  prebuilt `Engine/lib/libdcp-1.0` + `libdcpomatic2` with the rebuilt libs.
+- Done on the swift-dcp-player **build host** (macOS 14 VM, `admin@192.168.64.2`) where the Engine libs
+  are produced.
+- Verify `nm` shows `opj_set_t1_output_callback` in the rebuilt libdcp's opj, and that the app still
+  decodes a DCP normally before adding the hybrid path.
+
+**Resolve this first (C0)** — it gates everything.
 
 ## Phased sub-steps
 
-- **C0 — opj linking decision** (above). Prove the Swift target can call our fork's
-  `opj_set_t1_output_callback` alongside the existing libdcp without symbol conflict.
+- **C0 — opj linking: option (b)** (decided above). Rebuild libdcp + dcpomatic against the
+  `metal-jpeg2000` opj fork on the build host; swap the prebuilt Engine libs; confirm a DCP still
+  decodes normally and the decode-to-T1 symbol is present.
 - **C1 — expose the codestream.** Add `PlayerVideo::proxy()` getter (1 line) in dcpomatic; add a
   `PlayerEngine` method returning the decrypted J2K bytes + pts + eyes + reduce + size per frame
   (dynamic_cast to `J2KImageProxy`; fall back to `.image()` for non-DCP content). Verify by logging
