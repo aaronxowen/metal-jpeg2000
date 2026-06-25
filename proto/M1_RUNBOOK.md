@@ -93,6 +93,28 @@ awk '/Sort by top of stack/{f=1} f' /tmp/m1_sample.txt | head -20   # opj_t1_* v
 sample ran) the % in `opj_t1_*` so we can compute the real CPU **T1** time. With that we can answer:
 does `max(CPU_T1, 37 ms GPU back-end)` fit the 41.6 ms budget (→ hybrid wins), or must T1 itself be sped up?
 
+## Phase A-2 — overlapped hybrid harness (THE decision-gate measurement)
+
+This is the end-to-end test: CPU decodes frame N+1 through Tier-1 (multithreaded, via the fork's
+`opj_set_t1_output_callback`) while the GPU runs the back-end on frame N — overlapped — so per-frame
+time = `max(CPU T1, GPU back-end)`. Needs OpenJPEG built (Phase 2) + a `.j2c` frame +
+`proto/backend_corpus.bin` (for the integer-exact check).
+
+```sh
+swiftc -O proto/phase_a/hybrid_harness.swift \
+  -import-objc-header proto/phase_a/bridge.h \
+  -I src/lib/openjp2 -I build/src/lib/openjp2 \
+  -L build/bin -lopenjp2 -Xlinker -rpath -Xlinker "$(pwd)/build/bin" \
+  -framework Metal -framework Foundation -o /tmp/hybrid_harness
+
+FRAME=path/to/2K-Flat_ProRes422_StereoVF_000000.j2c
+/tmp/hybrid_harness "$FRAME" proto/backend_kernel.metal 120 proto/backend_corpus.bin
+```
+
+**Report:** the `OVERLAPPED hybrid` ms/frame + fps, the CPU/GPU calibration split, whether VALIDATION
+is integer-exact, and whether it MEETS 24fps. This is the number that decides whether the hybrid
+delivers realtime 2K on the M1. (M5 Pro reference: ~20 ms/frame, ~49 fps, integer-exact.)
+
 ## Regenerating corpora (only if the corpus files are missing)
 The corpora are derived from one real DCI 2K frame via env-gated dumps in the (committed) instrumented
 OpenJPEG. This requires building OpenJPEG (CMake + libpng/libtiff/lcms2) and a `.j2c` test frame —
