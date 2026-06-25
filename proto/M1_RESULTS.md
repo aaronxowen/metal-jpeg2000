@@ -92,3 +92,22 @@ The key question: does `max(CPU_T1, GPU_backend)` fit the 41.6 ms budget?
 - The GPU T1 kernel (54 ms) is **slower** than 4-core NEON T1 (36 ms); GPU T1 is not the right path.
 - **Recommended architecture: CPU T1 (all 4 cores) pipelined with GPU back-end across frames.**
   This leaves headroom (~4.6 ms) and keeps all CPU cores busy on the codec bottleneck while the GPU handles the back-end in parallel.
+
+---
+
+## Phase A-2 — Overlapped Hybrid Harness (decision-gate)
+
+CPU decodes frame N+1 through Tier-1 (multithreaded) while GPU runs the back-end on frame N.  
+Per-frame time = `max(CPU T1, GPU back-end)`. 120-frame run on real DCI 2K content.
+
+| Metric | Value |
+|---|---|
+| **Overlapped ms/frame** | **41.325 ms** |
+| **fps** | **24.2 fps** |
+| CPU T1 calibration | 18.998 ms/frame |
+| GPU back-end calibration | 38.520 ms/frame |
+| Critical path `max(CPU, GPU)` | 38.520 ms (GPU-bound) |
+| Validation | **INTEGER-EXACT vs oracle ✓** |
+| **MEETS 24fps budget (41.6 ms)?** | **YES ✓** |
+
+The hybrid delivers 2K realtime on the M1. The GPU back-end is the bottleneck; CPU T1 finishes well inside it at 19 ms. Margin over budget is 0.3 ms — thin but passing. (M5 Pro reference: ~20 ms/frame, ~49 fps.)
