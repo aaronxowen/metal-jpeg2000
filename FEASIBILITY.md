@@ -1,18 +1,51 @@
 # Feasibility Study: GPU-Accelerated JPEG 2000 on Apple Silicon (Metal)
 
-**Status:** Draft / scoping
+**Status:** Feasibility & correctness proven · GPU pipeline built and validated (M5 Pro + M1) · architecture decided · remaining work is integration engineering.
 **Date:** 2026-06-25
-**Target:** Hardware/GPU-accelerated JPEG 2000 encode + decode for Apple Metal, running on ARM64 / Apple Silicon (M-series).
-**Base:** This repo is a fork of [OpenJPEG](https://github.com/uclouvain/openjpeg) (UCLouvain, BSD-2), the ISO/ITU JPEG 2000 reference software. `upstream` → `uclouvain/openjpeg`.
-
-**Decision (2026-06-25):** Scope is **decode of existing Interop (IOP) and SMPTE DCP packages**.
-HTJ2K (Part 15) has no DCI compliance route today, so standards-compliant DCPs are all **Part-1,
-9/7, MQ-coded** → we are committed to the classic Tier-1 path. See §9 for what the DCI cinema
-profiles let us drop, and the resulting hybrid architecture.
+**Target:** GPU-accelerated JPEG 2000 **decode** for Apple Metal on Apple Silicon — concretely, to make realtime DCP playback possible on the low-floor **M1 Mac mini** (the current CPU/OpenJPEG path cannot play even a 2K DCP in realtime).
+**Base:** Fork of [OpenJPEG](https://github.com/uclouvain/openjpeg) (UCLouvain, BSD-2), the ISO/ITU JPEG 2000 reference software. `upstream` → `uclouvain/openjpeg`. Prototype code in `proto/`; branch `experiment/metal-t1-gpu`.
 
 ---
 
-## 1. Summary
+## Executive summary
+
+**Scope (locked):** decode of existing standards-compliant **IOP + SMPTE DCPs** → Part-1, 9/7,
+MQ-coded, DCI 2K/4K cinema profiles. HTJ2K (Part 15) has no DCI compliance route today, so it is out.
+
+**What was built and proven** (methodology: instrument OpenJPEG to dump per-stage corpora + oracles →
+portable-C reference → Metal kernel → exact validation):
+- The full GPU decode pipeline **minus Tier-2**: Tier-1 (MQ/EBCOT) **bit-exact**, and inverse 9/7 DWT
+  + inverse ICT + DC level-shift **integer-exact** vs OpenJPEG — validated on **both the M5 Pro and
+  the M1 GPU** (no cross-GPU divergence).
+
+**Key measured facts (M1 Mac mini, real DCI 2K frame):**
+- OpenJPEG CPU decode ≈ **57 ms/frame** (all cores) → misses the **41.6 ms/24fps** budget (root problem).
+- Tier-1 (MQ coder) ≈ **63%** of decode → CPU T1 ≈ **36 ms**; GPU T1 = **54 ms**; GPU back-end = **37 ms**.
+
+**Architecture decision — hybrid:** **CPU runs T2+T1; the GPU runs the back-end (iDWT+ICT+level-shift),
+overlapped across frames** (double-buffered, zero-copy via unified memory). **GPU T1 is abandoned** —
+the serial MQ coder runs faster on the CPU (36 ms) than on the GPU (54 ms). The GPU's job is the
+back-end and *freeing CPU cores*, not the bottleneck itself. This reframes the original "GPU-accelerate
+JPEG 2000" instinct: the win is load-balancing across two processors, not raw GPU throughput.
+
+**Realtime verdict:**
+- **2K@24 on the M1: plausible but tight, not yet proven.** Critical path ≈ `max(CPU side ~37–46 ms,
+  GPU back-end ~37 ms)` against a 41.6 ms budget — lands under the line only with buffer reuse (and
+  possibly the E-cores). Needs an end-to-end integration prototype to confirm.
+- **4K / HFR: out of reach** this way — the CPU MQ-coder wall is fundamental on 4 P-cores.
+- Guaranteed fallback: `reduce=1` decode (skip finest DWT level, ~75% less T1 work) with quality cost.
+
+**Next step:** integration, not more microbenchmarks — build the overlapped CPU‖GPU frame pipeline in
+the player and measure sustained fps on the M1 (see §16).
+
+**Reading guide:** §1–8 initial framing & GPU-mappability · §9–10 DCI scope + in-repo test content ·
+§11 CPU profiling (M5 Pro) · §12 GPU Tier-1 (bit-exact) · §13–14 GPU back-end (float/integer-exact) ·
+§15–16 **M1 results & the architecture decision** (most current). Sections are chronological; §1's
+framing of "Part-1 vs HTJ2K" was resolved in §9.
+
+---
+
+## 1. Initial framing (superseded by the Executive summary)
 
 Building a Metal/Apple-Silicon JPEG 2000 codec is **feasible**, but the value depends almost
 entirely on one strategic decision: whether to target classic **Part-1 (MQ arithmetic coder)**
