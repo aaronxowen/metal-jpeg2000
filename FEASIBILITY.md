@@ -489,3 +489,46 @@ GPU full back-end (iDWT+ICT+level-shift): 14.0 ms/frame
 Both GPU halves of the codec now reproduce OpenJPEG output exactly. Remaining work is **optimization**
 (threadgroup memory, batching, fused stages) and **measuring on the M1**, plus the separate
 `xyz_to_rgb` color stage (the likely highest-yield easy CPU-relief win, per §13).
+
+---
+
+## 15. M1 results + analysis (the real target)
+
+Run on the actual M1 Mac mini (4 P-cores, ~8-core GPU) via `proto/M1_RUNBOOK.md`; raw numbers in
+`proto/M1_RESULTS.md`. Corpus oracle held on the M1 GPU: **T1 bit-exact, back-end integer-exact** —
+no cross-GPU divergence (key portability win).
+
+| Stage | M1 GPU | vs scalar CPU ref |
+|---|---|---|
+| T1 (MQ/EBCOT) | 54.3 ms/frame | 1.44× |
+| iDWT | 35.9 ms/frame | 1.19× |
+| Full back-end (iDWT+ICT+shift) | 37.0 ms/frame | 1.10× |
+
+### Honest interpretation (corrects the M1_RESULTS verdict)
+
+- **Not realtime yet.** Unoptimized, T1 (54 ms) alone exceeds the 41.6 ms/24fps 2K budget; T1 +
+  back-end sequentially ≈ 91 ms ≈ **2.2× over budget**.
+- **The 1.1–1.44× margins overstate the advantage.** The CPU ref is clean-room scalar single-thread,
+  NOT OpenJPEG's NEON + 4-core threadpool. These ratios do **not** establish that the GPU beats the
+  real CPU decoder.
+- **Pipelining T1+back-end across frames does NOT help** as proposed: both run on the one GPU, so the
+  problem is throughput-bound (≈91 ms of GPU work/frame → ~11 fps ceiling), not latency-bound.
+  Pipelining only adds throughput when **different processors** run different stages — i.e. the
+  **hybrid: CPU does T1 while the GPU does the previous frame's back-end**, giving per-frame
+  `max(CPU_T1, GPU_backend≈37 ms)` instead of the sum.
+
+### Critical missing measurement (next step)
+
+Everything hinges on **OpenJPEG's actual M1 decode time — NEON, `-threads ALL` — total and T1-only.**
+That determines: (a) the true baseline gap (the current failing path), (b) whether GPU T1 (54 ms)
+beats CPU T1 or T1 should stay on the CPU, and (c) whether `max(CPU_T1, 37 ms GPU back-end)` clears
+41.6 ms. Build OpenJPEG on the M1 and time `opj_decompress` + the per-stage `sample` profile (as in §11).
+
+### Decision tree once that number exists
+
+- If **CPU_T1 (NEON, 4-thread) < ~41 ms**: hybrid wins — keep T1 on CPU, move back-end to GPU,
+  overlap across frames → likely realtime 2K. Lowest risk.
+- If **CPU_T1 ≥ ~41 ms**: T1 itself must get faster. Optimize the GPU T1 kernel (threadgroup-memory
+  flags/data, cut divergence, batch) targeting ~2× → ~27 ms, then hybrid or all-GPU-optimized.
+- Fallback for guaranteed realtime: decode at `reduce=1` (skip finest DWT level, ~75% less T1 work)
+  with quality tradeoff.

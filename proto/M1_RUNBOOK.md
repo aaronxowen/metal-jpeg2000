@@ -64,6 +64,35 @@ Note: the scalar CPU ref is *not* OpenJPEG's tuned NEON path — it's a clean-ro
 "equivalent scalar code" baseline but undersells the real CPU. The headline question is still GPU
 throughput on the M1 GPU. (A tuned-CPU comparison would require building OpenJPEG; skip unless asked.)
 
+## Phase 2 — OpenJPEG real-CPU baseline on the M1 (CRITICAL next measurement)
+
+The Phase-1 GPU-vs-CPU ratios use a clean-room *scalar single-thread* CPU ref, which undersells the
+real CPU. To decide the architecture we need OpenJPEG's **actual** M1 decode time (NEON + threadpool).
+This requires building OpenJPEG and one real DCI 2K `.j2c` frame (transfer one from the M5 box:
+`tests/test-content/jpeg2k-testImage/2K-Flat_ProRes422_StereoVF_000000.j2c`, ~228 KB).
+
+```sh
+# Build OpenJPEG (needs cmake + libpng/libtiff/lcms2; brew install them, or use Kitware cmake binary).
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_CODEC=ON -DBUILD_SHARED_LIBS=ON
+cmake --build build -j
+
+FRAME=path/to/2K-Flat_ProRes422_StereoVF_000000.j2c
+# Total decode time, single-thread and all-cores:
+for T in 1 ALL; do echo "threads=$T:"; DYLD_LIBRARY_PATH=build/bin build/bin/opj_decompress -i "$FRAME" -o /tmp/x.tif -threads $T 2>&1 | grep "decode time"; done
+```
+
+Optional per-stage split (confirms the T1 fraction on the M1) — compile the in-process loop and sample it:
+```sh
+clang -O2 -Isrc/lib/openjp2 -Ibuild/src/lib/openjp2 tests/bench_decode.c -o /tmp/bench_decode \
+  -Lbuild/bin -lopenjp2 -Wl,-rpath,$(pwd)/build/bin
+/tmp/bench_decode "$FRAME" 400 1 & sample $! 6 -file /tmp/m1_sample.txt
+awk '/Sort by top of stack/{f=1} f' /tmp/m1_sample.txt | head -20   # opj_t1_* vs opj_dwt_* vs opj_mct_*
+```
+
+**Report from Phase 2:** OpenJPEG total decode ms on M1 at `-threads 1` and `-threads ALL`; and (if the
+sample ran) the % in `opj_t1_*` so we can compute the real CPU **T1** time. With that we can answer:
+does `max(CPU_T1, 37 ms GPU back-end)` fit the 41.6 ms budget (→ hybrid wins), or must T1 itself be sped up?
+
 ## Regenerating corpora (only if the corpus files are missing)
 The corpora are derived from one real DCI 2K frame via env-gated dumps in the (committed) instrumented
 OpenJPEG. This requires building OpenJPEG (CMake + libpng/libtiff/lcms2) and a `.j2c` test frame —
