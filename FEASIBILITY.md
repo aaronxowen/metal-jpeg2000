@@ -532,3 +532,43 @@ beats CPU T1 or T1 should stay on the CPU, and (c) whether `max(CPU_T1, 37 ms GP
   flags/data, cut divergence, batch) targeting ~2× → ~27 ms, then hybrid or all-GPU-optimized.
 - Fallback for guaranteed realtime: decode at `reduce=1` (skip finest DWT level, ~75% less T1 work)
   with quality tradeoff.
+
+---
+
+## 16. M1 Phase-2 baseline + architecture decision
+
+OpenJPEG real decode on the M1 (NEON, threadpool), DCI 2K frame:
+
+| | Time | |
+|---|---|---|
+| `opj_decompress -threads 1` | 106 ms/frame | |
+| `opj_decompress -threads ALL` | **57 ms/frame** | confirms: OpenJPEG misses the 41.6 ms budget → the root problem |
+| T1 share (sampled) | **63.3%** | DWT ~18.6%, MCT ~1.4%, other (T2/alloc/IO) ~16.7% |
+| → CPU T1, all cores | **≈ 36 ms** | 57 × 63.3% |
+
+### Decision: hybrid (CPU T1 ‖ GPU back-end). GPU T1 abandoned.
+
+GPU T1 (54 ms) is **slower** than 4-core CPU T1 (36 ms) → don't put T1 on the GPU. Correct
+architecture: **CPU runs T2+T1; GPU runs the back-end (iDWT+ICT+level-shift); overlap across frames**
+(double-buffered, zero-copy via unified memory). Steady-state ≈ `max(CPU side, GPU side)`.
+
+### Correction to the M1_RESULTS verdict — it's tight, not a clean win
+
+That verdict used `max(CPU_T1=36, GPU_backend=37) ≈ 37 ms ✓`, but the CPU side keeps **everything
+except the back-end** (~80% of 57 ms ≈ **45.6 ms**), not just T1. So the real critical path is
+`max(45.6, 37) ≈ 45.6 ms` — slightly **over** the 41.6 ms budget as measured.
+
+Caveats that pull it back under:
+- Much of "other ~16.7%" is alloc/memset/IO — partly a per-iteration harness artifact; **buffer reuse**
+  in a real player removes most, pulling the CPU side toward ~37–40 ms. T2 itself is ~1%.
+- "-threads ALL" was reported as **4 P-cores**; the M1 also has 4 E-cores — possibly untapped for T1.
+
+**Honest conclusion:** realtime 2K@24 on the M1 via the hybrid is **plausible and close (~37–46 ms vs
+41.6 ms) but not yet proven** — both sides balance right at the budget line. 4K/HFR won't fit this way.
+
+### Next: prove it with an integration prototype
+
+The decisive test is no longer a kernel microbenchmark — it's an **end-to-end overlapped hybrid**:
+CPU T1 (OpenJPEG, buffers reused) for frame N+1 running concurrently with the GPU back-end for frame N,
+measured as sustained fps on the M1. Secondary levers if it lands just over: optimize the GPU back-end
+(threadgroup memory — frees scheduling slack), use M1 E-cores for T1, or `reduce=1` fallback.
