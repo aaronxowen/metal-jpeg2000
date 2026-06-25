@@ -1497,6 +1497,40 @@ OPJ_API OPJ_BOOL OPJ_CALLCONV opj_get_decoded_tile(opj_codec_t *p_codec,
 OPJ_API OPJ_BOOL OPJ_CALLCONV opj_set_decoded_resolution_factor(
     opj_codec_t *p_codec, OPJ_UINT32 res_factor);
 
+/* ---------------------------------------------------------------------- */
+/* metal-jpeg2000 fork: "decode-to-Tier-1" hook (hybrid CPU/GPU decode).
+ *
+ * Lets an external (GPU) back-end take over after Tier-1. When a callback is
+ * registered, opj_decode() invokes it once per tile, right after Tier-1, with
+ * the post-T1 per-component coefficient buffers (for 9-7, float bit-patterns in
+ * the OPJ_INT32 slots) and the geometry/params the inverse DWT + MCT +
+ * level-shift need. If skip_backend is set, opj skips its own DWT/MCT/level-shift.
+ * Whole-tile decoding only. Not thread-safe (global state); intended for the
+ * single-decode-thread player contract. */
+typedef struct opj_t1_output {
+    OPJ_UINT32 numcomps;
+    OPJ_UINT32 w;                 /* tile-component width  (full res) */
+    OPJ_UINT32 h;                 /* tile-component height (full res) */
+    OPJ_UINT32 numres;            /* number of resolution levels */
+    const OPJ_INT32* boxes;       /* numres * 4 ints: x0,y0,x1,y1 per resolution */
+    const OPJ_INT32* prec;        /* numcomps: bit depth per component */
+    const OPJ_INT32* sgnd;        /* numcomps: signedness per component */
+    const OPJ_INT32* dc_shift;    /* numcomps: DC level shift per component */
+    OPJ_INT32 mct;                /* component-transform flag (0/1/2) */
+    OPJ_INT32* const* comp_data;  /* numcomps pointers to w*h post-T1 coefficients */
+} opj_t1_output_t;
+
+typedef void (*opj_t1_output_cb)(const opj_t1_output_t* info, void* user_data);
+
+/**
+ * Register (or clear, with cb==NULL) the decode-to-Tier-1 callback.
+ * @param cb            callback invoked after Tier-1 per tile (NULL to disable)
+ * @param user_data     opaque pointer passed back to the callback
+ * @param skip_backend  if OPJ_TRUE, opj skips its own DWT/MCT/level-shift
+ */
+OPJ_API void OPJ_CALLCONV opj_set_t1_output_callback(opj_t1_output_cb cb,
+        void* user_data, OPJ_BOOL skip_backend);
+
 /**
  * Writes a tile with the given data.
  *

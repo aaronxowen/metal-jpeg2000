@@ -42,6 +42,19 @@
 #include "opj_includes.h"
 #include "opj_common.h"
 
+/* metal-jpeg2000 fork: decode-to-Tier-1 callback state (see openjpeg.h /
+ * opj_set_t1_output_callback). Global; single-decode-thread contract. */
+static opj_t1_output_cb opj_gs_t1cb = NULL;
+static void* opj_gs_t1cb_user = NULL;
+static OPJ_BOOL opj_gs_t1cb_skip = OPJ_FALSE;
+void OPJ_CALLCONV opj_set_t1_output_callback(opj_t1_output_cb cb,
+        void* user_data, OPJ_BOOL skip_backend)
+{
+    opj_gs_t1cb = cb;
+    opj_gs_t1cb_user = user_data;
+    opj_gs_t1cb_skip = skip_backend;
+}
+
 // #define DEBUG_RATE_ALLOC
 
 /* ----------------------------------------------------------------------- */
@@ -1808,6 +1821,46 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
             fwrite(tile->comps[c].data, sizeof(OPJ_INT32), (size_t)s_bk_w * s_bk_h, s_bk);
     }
     /* --- END back-end dump (input) --- */
+
+    /* --- metal-jpeg2000 decode-to-Tier-1 callback (hybrid CPU/GPU decode) --- */
+    if (opj_gs_t1cb && p_tcd->whole_tile_decoding) {
+        opj_tcd_tile_t* tile = p_tcd->tcd_image->tiles;
+        OPJ_UINT32 nc = tile->numcomps, c, r;
+        opj_tcd_tilecomp_t* tc0 = &tile->comps[0];
+        OPJ_UINT32 numres = tc0->minimum_num_resolutions;
+        opj_tcd_resolution_t* rr = &tc0->resolutions[numres - 1];
+        OPJ_INT32 boxes[32 * 4]; /* >= max resolutions */
+        OPJ_INT32 prec[16], sgnd[16], dcs[16];
+        OPJ_INT32* cdata[16];
+        opj_t1_output_t out;
+        if (numres <= 32 && nc <= 16) {
+            for (r = 0; r < numres; ++r) {
+                boxes[r * 4 + 0] = tc0->resolutions[r].x0;
+                boxes[r * 4 + 1] = tc0->resolutions[r].y0;
+                boxes[r * 4 + 2] = tc0->resolutions[r].x1;
+                boxes[r * 4 + 3] = tc0->resolutions[r].y1;
+            }
+            for (c = 0; c < nc; ++c) {
+                prec[c] = (OPJ_INT32)p_tcd->image->comps[c].prec;
+                sgnd[c] = (OPJ_INT32)p_tcd->image->comps[c].sgnd;
+                dcs[c]  = p_tcd->tcp->tccps[c].m_dc_level_shift;
+                cdata[c] = tile->comps[c].data;
+            }
+            out.numcomps = nc;
+            out.w = (OPJ_UINT32)(rr->x1 - rr->x0);
+            out.h = (OPJ_UINT32)(rr->y1 - rr->y0);
+            out.numres = numres;
+            out.boxes = boxes;
+            out.prec = prec; out.sgnd = sgnd; out.dc_shift = dcs;
+            out.mct = (OPJ_INT32)p_tcd->tcp->mct;
+            out.comp_data = cdata;
+            opj_gs_t1cb(&out, opj_gs_t1cb_user);
+            if (opj_gs_t1cb_skip) {
+                return OPJ_TRUE;  /* external back-end takes over */
+            }
+        }
+    }
+    /* --- END decode-to-Tier-1 callback --- */
 
     /*----------------DWT---------------------*/
 
