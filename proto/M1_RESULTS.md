@@ -56,3 +56,39 @@ Frame: 1998×1080, 3 comps, 6 res, MCT on, 6,473,520 samples
 The M1's weaker CPU gives the GPU a clearer T1 win than was seen on the M5 Pro. However, **T1 alone at 54.3 ms already exceeds the 41.6 ms/frame @ 24fps 2K realtime budget**. The back-end (37.0 ms) fits the budget individually, but the combined sequential pipeline (T1 + back-end ≈ 91 ms) is ~2.2× over budget. Pipelining T1 and back-end across frames is the next lever to investigate.
 
 The scalar CPU ref is a clean-room reference, not OpenJPEG's tuned NEON path — it undersells the real CPU floor. The headline result remains GPU throughput on the M1 GPU.
+
+---
+
+## Phase 2 — OpenJPEG Real CPU Baseline
+
+### Total decode time (opj_decompress, real DCI 2K frame)
+
+| Threads | Decode time |
+|---|---|
+| `-threads 1` | 106 ms/frame |
+| `-threads ALL` (4 P-cores) | **57 ms/frame** |
+
+### T1 fraction (sampled from single-threaded bench_decode, 400 iters)
+
+| Symbol group | Samples | Share |
+|---|---|---|
+| `opj_t1_*` (MQ/EBCOT) | 3,029 / 4,787 | **63.3%** |
+| `opj_v8dwt_*` + `opj_dwt_*` (DWT) | ~890 | ~18.6% |
+| `opj_mct_*` (MCT/ICT) | 67 | ~1.4% |
+| Other (T2 parse, alloc, I/O) | ~801 | ~16.7% |
+
+### Derived real CPU T1 time
+
+| | T1 time |
+|---|---|
+| Single-thread (1 P-core) | 106 ms × 63.3% ≈ **67 ms** |
+| All-cores (4 P-cores) | 57 ms × 63.3% ≈ **36 ms** |
+
+### Architecture verdict
+
+The key question: does `max(CPU_T1, GPU_backend)` fit the 41.6 ms budget?
+
+- **All-cores CPU T1 ≈ 36 ms**, GPU back-end ≈ 37 ms → critical path `max(36, 37)` ≈ **37 ms — within budget ✓**
+- The GPU T1 kernel (54 ms) is **slower** than 4-core NEON T1 (36 ms); GPU T1 is not the right path.
+- **Recommended architecture: CPU T1 (all 4 cores) pipelined with GPU back-end across frames.**
+  This leaves headroom (~4.6 ms) and keeps all CPU cores busy on the codec bottleneck while the GPU handles the back-end in parallel.
