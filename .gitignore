@@ -16,3 +16,8 @@ scripts/opjstyle*
 
 # Ignore directories made by `make`.
 /bin/
+
+# metal-t1-gpu experiment: build artifacts, generated corpus, and large test media
+/build/
+/proto/corpus.bin
+/tests/test-content/

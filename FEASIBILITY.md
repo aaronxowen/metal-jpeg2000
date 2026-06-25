@@ -1,0 +1,413 @@
+# Feasibility Study: GPU-Accelerated JPEG 2000 on Apple Silicon (Metal)
+
+**Status:** Draft / scoping
+**Date:** 2026-06-25
+**Target:** Hardware/GPU-accelerated JPEG 2000 encode + decode for Apple Metal, running on ARM64 / Apple Silicon (M-series).
+**Base:** This repo is a fork of [OpenJPEG](https://github.com/uclouvain/openjpeg) (UCLouvain, BSD-2), the ISO/ITU JPEG 2000 reference software. `upstream` → `uclouvain/openjpeg`.
+
+**Decision (2026-06-25):** Scope is **decode of existing Interop (IOP) and SMPTE DCP packages**.
+HTJ2K (Part 15) has no DCI compliance route today, so standards-compliant DCPs are all **Part-1,
+9/7, MQ-coded** → we are committed to the classic Tier-1 path. See §9 for what the DCI cinema
+profiles let us drop, and the resulting hybrid architecture.
+
+---
+
+## 1. Summary
+
+Building a Metal/Apple-Silicon JPEG 2000 codec is **feasible**, but the value depends almost
+entirely on one strategic decision: whether to target classic **Part-1 (MQ arithmetic coder)**
+codestreams or **HTJ2K (Part 15, High Throughput)**.
+
+- The **embarrassingly parallel stages** (color transform, wavelet transform, quantization) map
+  cleanly to Metal compute and are a guaranteed win.
+- The **Tier-1 block coder** is the wall. In classic Part-1 it is the MQ arithmetic coder — serial,
+  context-adaptive, feedback-driven — and it is **50–70% of total codec time**. It resists GPU
+  parallelism. HTJ2K replaces this stage with a deliberately parallel/SIMD-friendly block coder,
+  which is the reason GPU JPEG 2000 implementations (e.g. NVIDIA's nvJPEG2000) post their headline
+  throughput numbers on HTJ2K.
+- **Apple Silicon's unified memory is a structural advantage** over discrete-GPU CUDA designs: there
+  is no PCIe host↔device copy to hide.
+
+---
+
+## 2. The NVIDIA reference: useful, but not as code
+
+The requested reference,
+[NVIDIA/CUDALibrarySamples/nvJPEG2000](https://github.com/NVIDIA/CUDALibrarySamples/tree/main/nvJPEG2000),
+contains **sample programs only**:
+
+- `nvJPEG2000-Decoder`
+- `nvJPEG2000-Decoder-Pipelined`
+- `nvJPEG2000-Decoder-Tile-Partial`
+- `nvJPEG2000-Encoder`
+
+These call the **precompiled, closed-source `nvjpeg2000` library** shipped in the CUDA Toolkit. The
+GPU kernels are not in that repo and are not published anywhere. Consequence:
+
+> nvJPEG2000 is a **design north star and performance benchmark target**, not an implementation
+> reference. For actual algorithms we use open code (§6).
+
+One sample is still informative architecturally: `nvJPEG2000-Decoder-Pipelined` exists mainly to
+overlap PCIe transfers with compute — a problem Apple Silicon's unified memory **eliminates** (§5).
+
+---
+
+## 3. What this fork gives us
+
+OpenJPEG is the ground-truth reference implementation and our bit-exact validation oracle. Relevant
+source (`src/lib/openjp2/`):
+
+| File | Role |
+|---|---|
+| `mct.c` | Multiple Component (color) Transform — RCT (lossless) / ICT (lossy) |
+| `dwt.c` (~150 KB, has SSE/AVX) | Discrete Wavelet Transform — 5/3 reversible, 9/7 irreversible |
+| `t1.c` + `mqc.c` | **Part-1 Tier-1**: EBCOT bit-plane coding + MQ arithmetic coder |
+| `ht_dec.c` | **HTJ2K (Part 15) block decoder** (no `ht_enc.c` — OpenJPEG only added HT *decode*) |
+| `t2.c`, `pi.c` | Tier-2 packetization + packet iterator (codestream assembly) |
+| `tcd.c` | Tile coder/decoder orchestration |
+| `thread.c`, `bench_dwt.c` | Existing CPU threadpool + DWT benchmark (baseline reference) |
+
+Note: HTJ2K **encode** is not present in OpenJPEG. For that path the reference is OpenJPH/Grok (§6).
+
+---
+
+## 4. Stage-by-stage GPU mappability
+
+| Stage | File(s) | Metal fit | Why |
+|---|---|---|---|
+| DC level-shift + MCT | `mct.c` | **Excellent** | Per-pixel, embarrassingly parallel |
+| DWT (5/3, 9/7) | `dwt.c` | **Excellent** | Separable lifting; well-studied on GPU; the large, easy win |
+| Quantization / dequant | `tcd.c`, `t1.c` | **Excellent** | Per-coefficient |
+| **Tier-1: EBCOT + MQ (Part 1)** | `t1.c`, `mqc.c` | **Poor** | MQ is a serial, context-adaptive arithmetic coder with per-symbol feedback. Only parallelism is *across* codeblocks (one block/thread → heavy divergence, poor SIMD-lane use). ~50–70% of codec time. |
+| **Tier-1: HT block coder (Part 15)** | `ht_dec.c` | **Good** | Purpose-built parallel: MagSgn + MEL + VLC, single cleanup pass instead of 3 sequential bit-plane passes. |
+| Tier-2: packetization, PCRD-opt | `t2.c`, `pi.c` | **Poor** | Inherently serial bitstream parsing; normally stays on CPU |
+
+**The decisive fork:**
+
+- **Targeting existing DCI DCPs** → they are Part-1, 9/7, MQ-coded. The hard path. GPU-accelerating
+  DWT+MCT+dequant yields real gains, but the serial Tier-1 bounds end-to-end speedup (Amdahl). This
+  is why a decade of CUDA Part-1 projects showed only modest end-to-end wins.
+- **A new HTJ2K pipeline** → the HT block coder is what makes a GPU codec genuinely worthwhile.
+  SMPTE has standardized HTJ2K for IMF; it is the live direction for high-throughput cinema. If the
+  codestream is ours to choose, this is the path.
+
+---
+
+## 5. Apple Silicon / Metal specifics
+
+**Advantages (some better than CUDA):**
+
+- **Unified memory is a structural win.** No PCIe, no host↔device copy. `MTLStorageModeShared` gives
+  the GPU zero-copy access to codestream and output buffers — removing the entire problem class that
+  nvJPEG2000's pipelined decoder is built to hide. Significant for a streaming/real-time cinema decoder.
+- High memory bandwidth (M-Max/Ultra ≈ 400–800 GB/s) suits the bandwidth-bound parallel stages.
+
+**Gaps to work through:**
+
+- **No code reuse from CUDA.** MSL is a C++14 dialect; no mature CUDA→Metal transpiler. Kernels are
+  rewritten. Concepts port cleanly though:
+  - CUDA warp → Metal **SIMD-group** (32-wide on Apple GPUs)
+  - `__shfl` / ballot / prefix → `simd_shuffle` / `simd_ballot` / `simd_prefix_*`
+  - shared memory → threadgroup memory (~32 KB)
+  - `popcount` / `clz` / atomics available for EBCOT bit-twiddling
+- **Thousands of tiny codeblock dispatches** → use **indirect command buffers** + `MTLHeap` to avoid
+  per-dispatch overhead.
+- **Sparse Metal prior art.** Almost all GPU JPEG 2000 work is CUDA/OpenCL; expect to port algorithms,
+  not copy Metal code.
+
+---
+
+## 6. References to use (instead of / alongside NVIDIA)
+
+- **OpenJPEG** (this repo) — ground truth + bit-exact validation oracle.
+- **OpenJPH** (Aous Naman) — cleanest HTJ2K reference *with SIMD*, by HTJ2K's designer. Best model for
+  the HT block coder and the HT *encoder* OpenJPEG lacks.
+- **Grok** — modern C++ JPEG 2000 (Part-1 + HT, encode + decode).
+- Open CUDA prior art for parallelization patterns: **CUJ2K**, **GPU-JPEG2000**, and academic
+  Tier-1-on-GPU papers (Matela et al.).
+- **nvJPEG2000 samples** — keep as API shape + throughput yardstick only.
+
+---
+
+## 7. Recommended phased approach (de-risk the wall early)
+
+1. **Baseline & profile** OpenJPEG CPU on the target M-series to quantify the real per-stage split for
+   *our* content (2K vs 4K, lossless vs 9/7).
+2. **Metal DWT + MCT + dequant** with unified-memory zero-copy; validate bit-exact vs OpenJPEG.
+   Low risk, real speedup, proves the harness.
+3. **Decide the fork:** Part-1 MQ (compatibility) vs HTJ2K (throughput). Prototype a single HT
+   codeblock decode kernel from `ht_dec.c` / OpenJPH and measure the actual GPU win **before**
+   committing.
+4. Only then attempt full Tier-1 on GPU.
+
+---
+
+## 8. Open questions
+
+- ~~Primary use case: decode existing DCI DCPs (Part-1, forced) vs new HTJ2K pipeline?~~
+  **Resolved:** decode existing IOP + SMPTE DCPs → Part-1 / 9-7 / MQ. See §9.
+- Real-time playback decode, batch decode, or both? (Sets the per-frame time budget: ~41 ms @ 24 fps,
+  ~20 ms @ 48 fps HFR.)
+- 2K and/or 4K? (4K ≈ 4× the codeblock count and a 6th DWT level.)
+- Minimum supported Apple GPU family (affects SIMD-group features, threadgroup memory).
+
+---
+
+## 9. Decision: decode of DCI Part-1 DCPs — implications
+
+HTJ2K is not yet permitted by the DCI Digital Cinema System Specification, so compliant IOP and
+SMPTE DCPs are all Part-1 / 9-7 / MQ-coded. We are on the classic Tier-1 path — but scoping to the
+**DCI cinema profiles** (ISO/IEC 15444-1 cinema profiles, carried by SMPTE ST 429-4) removes most of
+what makes general JPEG 2000 GPU-hostile.
+
+### What the DCI profiles let us drop
+
+| Parameter | General J2K | **DCI DCP (locked)** | GPU consequence |
+|---|---|---|---|
+| Wavelet | 5/3 or 9/7 | **9/7 irreversible only** | One DWT kernel path, not two |
+| Codeblocks | 16×16 … 64×64, vary at edges | **32×32, uniform** | **Removes the biggest source of thread divergence** — uniform geometry + memory layout |
+| Tiling | many tiles | **single tile per image** | No tile orchestration; parallelism is intra-frame codeblocks |
+| Component (MCT) transform | optional RCT/ICT | **may be ON** — see note | Conditional inverse ICT stage required; do **not** assume it is absent |
+| Resolution levels | variable | **NL=5 (2K), NL=6 (4K)** | Fixed inverse-DWT depth |
+| Progression | any | **CPRL** | Predictable precinct/packet walk for Tier-2 |
+
+The uniform **32×32 codeblock** is the key line: the classic "one block per thread → catastrophic
+divergence" problem is mostly about *variable* block sizes; under DCI it reduces to content-dependent
+divergence only (bitplane count / early termination), not geometry.
+
+**MCT correction (verified against test content):** the in-repo test frames
+(`tests/test-content/jpeg200_easyDCP_encoded/`, Rec709 color bars from easyDCP) carry the 2K DCI
+profile (`Rsiz=0x0003`) **with MCT enabled (`COD` MCT flag = 1)**. Real X′Y′Z′ distribution DCPs are
+typically authored MCT-off, but the DCI 2K profile does not forbid MCT. The decoder must read the COD
+flag per codestream and conditionally run the inverse ICT (a trivially parallel per-pixel 3×3 matrix
+op — folds into the GPU back-end after the inverse DWT). It cannot be assumed away.
+
+> Confirm precinct sizes and profile-version edge cases against the DCI DCSS and SMPTE ST 429-4 before
+> locking kernel assumptions. Verified parameters from the in-repo test frames are in §10.
+
+### The DCI decode pipeline
+
+1. **Decrypt** (AES-128-CBC per KDM) — CPU, hardware AES, not a bottleneck.
+2. **Tier-2**: parse codestream → packets per precinct/codeblock. Serial → **CPU**.
+3. **Tier-1**: MQ arithmetic decode + EBCOT bitplane passes per 32×32 block. **The wall.**
+4. **Dequantize** (9/7 scalar).
+5. **Inverse 9/7 DWT** (5 or 6 levels).
+6. **Inverse MCT/ICT** — *conditional* on the COD MCT flag (the in-repo test frames have it ON).
+7. **Inverse DC level shift** → 12-bit component output.
+
+Block-count sanity check: 2K frame ≈ ~6,000 codeblocks (×3 components), 4K ≈ ~24,000. Ample parallel
+work to saturate an Apple GPU across blocks; the constraint is per-block serial latency + divergence
+inside Tier-1, never occupancy.
+
+### Recommended architecture: hybrid (CPU Tier-1 + GPU back-end)
+
+OpenJPEG already parallelizes Tier-1 across codeblocks via its CPU threadpool (`thread.c`), and an
+M-series has 8–12 fast P-cores that are genuinely good at serial MQ decoding. An all-GPU MQ decoder
+must beat that on exactly the stage GPUs hate. So:
+
+- **CPU**: Tier-2 + Tier-1 MQ decode, across all P-cores (lean on OpenJPEG's existing threadpool).
+- **GPU**: dequant + inverse 9/7 DWT + level-shift, reading the CPU's coefficient output **zero-copy**
+  via `MTLStorageModeShared` — unified memory makes the CPU→GPU handoff free.
+
+Full-GPU Tier-1 becomes a **research track**, pursued only if profiling shows Tier-1 still dominates
+after the DWT moves to the GPU. Prototype one 32×32 MQ codeblock kernel and measure before committing.
+
+This makes the safe win (DWT/dequant on GPU, no copy) independent of the risky bet (MQ on GPU).
+
+---
+
+## 10. Verified test content (in-repo)
+
+`tests/test-content/`:
+- `jpeg200_easyDCP_encoded/` — 48 `.j2c` frames, color bars (Rec709), easyDCP-encoded.
+- `tiffs-adobe-premiere-encoded/` — 48 `.tif` frames (decoded references / source).
+
+Codestream parameters decoded from `Bars+Tone_Rec709_00.j2c` (SIZ + COD markers), representative of
+the set (all 48 are identical 41,457-byte frames):
+
+| Field | Value |
+|---|---|
+| Profile (`Rsiz`) | `0x0003` — 2K Digital Cinema |
+| Image size | 1998 × 1080 (DCI 2K Flat) |
+| Components | 3 × 12-bit, no subsampling |
+| Tiling | single tile (1998 × 1080) |
+| Progression | CPRL |
+| Quality layers | 1 |
+| **MCT** | **enabled (ICT)** |
+| Decomposition levels | 5 |
+| Codeblock size | 32 × 32 |
+| Wavelet | 9/7 irreversible |
+| Precincts | 128×128 (lowest res), 256×256 (rest) |
+
+These are a valid first profiling + bit-exact validation target: decode with OpenJPEG CPU, compare to
+the matching TIFFs, then use the same frames to validate Metal kernels stage-by-stage.
+
+---
+
+## 11. Profiling results (M5 Pro, 2026-06-25)
+
+**Machine:** Apple M5 Pro, 6 P-cores + 12 E-cores. OpenJPEG 2.5.4, Release, built locally.
+**Content:** `Bars+Tone_Rec709_00.j2c` (1998×1080, the §10 frame).
+
+### Wall-clock decode (per frame, `opj_decompress -threads`)
+
+| Threads | Decode time |
+|---|---|
+| 1 | ~24 ms |
+| 6 | ~55 ms (threadpool overhead exceeds gain on a single-tile frame) |
+| ALL (18) | ~17 ms |
+
+**Single-threaded 2K decode (~24 ms) is already inside the 24fps budget (41.6 ms).** The GPU value
+proposition therefore lives at **4K, HFR (48/60 fps), and multi-stream**, not 2K@24.
+
+### Per-stage attribution (sampling profiler, single-threaded leaf/self-time)
+
+Profiled on two content types — color bars (`jpeg200_easyDCP_encoded/`) and detailed real content
+(`jpeg2k-testImage/`, 2K-Flat ProRes422 source, ~228 KB/frame vs 41 KB for bars):
+
+| Stage | Color bars | **ProRes (real)** | GPU fit |
+|---|---:|---:|---|
+| Tier-1 (MQ / EBCOT) | 36.9% | **71.0%** | Poor (the wall) |
+| Inverse DWT (9/7) | 39.6% | 17.8% | Excellent |
+| Level-shift / tile→image copy | 20.4% | 9.1% | Excellent (per-pixel) |
+| Inverse MCT / ICT | 2.3% | 1.1% | Excellent (per-pixel) |
+| Tier-2 (packet parse) | 0.8% | 1.1% | Serial → CPU |
+
+Wall-clock, ProRes content: **53 ms single-thread / 35 ms all-cores** (vs 24 / 17 ms for bars).
+
+### Interpretation — content type flips the strategy
+
+- **Real content is Tier-1-bound (~71%), textbook 50–70%.** The color bars (T1 ~37%) were a misleading
+  best case — highly compressible → few coding passes. Detailed content confirms the classic reality:
+  the MQ coder is the bottleneck. **Use the ProRes numbers, not the bars, for all sizing.**
+- **The GPU back-end (DWT + level-shift + MCT) addresses only ~28% of real-content decode time.**
+  Amdahl ceiling if that 28% becomes free: **~1.4× (53 → ~38 ms at 2K)**. And CPU all-cores already
+  does 2K real content in 35 ms, so the back-end alone buys little at 2K.
+- **At 4K (~4× work) the Tier-1 wall dominates and the back-end-only hybrid cannot reach real-time**
+  (~150–210 ms/frame; shaving 28% leaves ~110–150 ms, 3–4× over the 41.6 ms budget).
+- **OpenJPEG's DWT is already NEON-vectorized** (`opj_v8dwt_interleave_h`); the Metal DWT competes
+  against SIMD'd CPU code. The win comes from GPU bandwidth/parallelism at 4K, not out-vectorizing at 2K.
+
+### Revised conclusion (supersedes the §9 "optional research track" framing)
+
+For the committed use case (real DCP content, especially 4K / HFR), **GPU Tier-1 is on the critical
+path, not optional.** The back-end-first hybrid is still the right *first* deliverable (low risk,
+de-risks the harness, helps 2K), but it caps at ~1.4×. Meaningful speedup at 4K **requires** a Metal
+MQ-decoder kernel: one 32×32 codeblock per thread, parallel across the ~6,000 blocks/frame.
+
+Prior-art reality check: this is where open CUDA Part-1 implementations earned **modest ~2–4× wins**,
+not the 10–50× of embarrassingly parallel work — and why nvJPEG2000's headline throughput is all
+HTJ2K, never Part-1 MQ. GPU Tier-1 for Part-1 is feasible but is the project's principal risk; it
+should be prototyped and measured (single-codeblock kernel) before committing to a full build.
+
+### Reproduce
+
+```sh
+# Build (CMake 4.x ok; OpenJPEG uses VERSION 3.10...3.31.5 range syntax):
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_CODEC=ON -DBUILD_SHARED_LIBS=ON
+cmake --build build -j
+
+# Verify codestream params:
+DYLD_LIBRARY_PATH=build/bin build/bin/opj_dump -i <frame>.j2c
+
+# Time a decode:
+DYLD_LIBRARY_PATH=build/bin build/bin/opj_decompress -i <frame>.j2c -o /tmp/o.tif -threads ALL
+
+# Per-stage profile: in-process decode loop, profiled under macOS `sample`:
+clang -O2 -Isrc/lib/openjp2 -Ibuild/src/lib/openjp2 tests/bench_decode.c -o /tmp/bench_decode \
+  -Lbuild/bin -lopenjp2 -Wl,-rpath,$(pwd)/build/bin
+/tmp/bench_decode <frame>.j2c 600 1 & sample $! 6 -file /tmp/oj_sample.txt
+```
+
+---
+
+## 12. T1 GPU kernel prototype — progress
+
+**Goal (decided):** retire the principal risk by porting one 32×32 MQ-decode codeblock kernel to
+Metal, benchmark vs OpenJPEG CPU (`opj_t1_clbl_decode_processor`), validate bit-exact.
+
+### Corpus + oracle (done)
+
+`opj_t1_decode_cblk` (src/lib/openjp2/t1.c) has an **env-gated corpus dump** (`OPJ_T1_DUMP=<path>`,
+decode with `-threads 1`). Per non-trivial codeblock it writes: `orient, roishift, cblksty, numbps,
+w, h, num_segs`, per-seg `(len, real_num_passes)`, total compressed bytes + the bytes, then the
+decoded coefficients (w·h int32) as a **bit-exact oracle**. Extract:
+
+```sh
+OPJ_T1_DUMP=proto/corpus.bin DYLD_LIBRARY_PATH=build/bin \
+  build/bin/opj_decompress -i <frame>.j2c -o /tmp/x.tif -threads 1
+```
+
+### Workload characterization (one ProRes 2K frame → `proto/corpus.bin`, 11.6 MB)
+
+- **2,972 non-trivial codeblocks** (empty/zero blocks return before decode → excluded; these are the
+  real T1 work). Corpus parses to exact EOF.
+- **All cblksty=0, all single-segment** → confirms the kernel needs only the MQ path of the three
+  passes: no RAW/bypass, no RESTART, no vertical-stripe-causal, no segment-symbol. Major simplification.
+- **84% are full 32×32**; remainder are edge blocks (smaller w/h ≤ 32). Kernel handles variable w,h.
+- **orient** mix HL/LH/HH (1/2/3) dominant, few LL — selects the ZC context LUT.
+- **numbps 1–13** (broad) → the per-block divergence source (variable pass count).
+- Compressed bytes/block: min 2, max 1520, mean 74 (≈221 KB total, matches frame payload).
+
+### Reference decoder (done — bit-exact)
+
+`proto/t1_ref.c` — a self-contained, dependency-free port of the MQ coder + all three decode passes
+(sigpass/refpass/clnpass), the cblksty=0 MQ-only path. Reads `proto/corpus.bin`, decodes every block,
+compares to the oracle:
+
+```
+codeblocks: 2972   PASS: 2972   FAIL: 0
+CPU reference T1 decode: 41.82 ms for 2972 cblks (14.1 us/cblk) [plain C, single-thread, M5 Pro]
+```
+
+**All 2,972 blocks bit-exact.** This validates the full algorithm understanding + corpus completeness,
+and is the exact code that ports to MSL (written with plain arrays/indices, no library pointers).
+Build/run: `clang -O2 proto/t1_ref.c -o /tmp/t1_ref && /tmp/t1_ref proto/corpus.bin`.
+
+### Metal kernel + benchmark (done — bit-exact, working)
+
+`proto/t1_kernel.metal` (1 thread = 1 codeblock, near-mechanical port of `t1_ref.c`),
+`proto/t1_luts.metal` (generated from `t1_luts.h`), `proto/t1_bench.swift` (headless harness:
+unified-memory buffers, dispatch, bit-exact check, timing).
+
+```
+parsed 2972 codeblocks ... GPU: Apple M5 Pro
+BIT-EXACT: all 2821292 coeffs match oracle ✓
+GPU T1 decode: best 14.684 ms for 2972 cblks (4.94 us/cblk)
+```
+
+| Decoder (M5 Pro) | Time / frame | Per block | |
+|---|---|---|---|
+| CPU reference (plain C, 1 thread) | 41.8 ms | 14.1 µs | scalar port |
+| **GPU Metal kernel** | **14.7 ms** | **4.9 µs** | **~2.85× vs scalar CPU, bit-exact** |
+
+Build/run:
+```sh
+python3 proto/gen_luts.py    # (the snippet that wrote proto/t1_luts.metal)
+swiftc -O proto/t1_bench.swift -o /tmp/t1_bench -framework Metal -framework Foundation
+/tmp/t1_bench proto/corpus.bin proto/t1_luts.metal proto/t1_kernel.metal
+```
+
+### Interpretation + headroom
+
+- **The principal risk is retired: GPU Part-1 T1 decode is feasible and bit-exact**, at ~2.85× the
+  equivalent scalar CPU code — squarely in the prior-art band (~2–4× for Part-1 MQ; the big numbers
+  are HTJ2K-only). It does **not** 10× the way embarrassingly parallel stages do; the MQ coder's
+  serial nature and per-block divergence are the limiters, as expected.
+- This kernel is **unoptimized**: flags/data live in device memory (uncoalesced), no threadgroup
+  tiling, and a single frame is only 2,972 threads — too few to saturate the M5 Pro GPU, so the time
+  is divergence/latency-bound (the numbps=13 blocks gate the dispatch). Headroom: threadgroup-memory
+  scratch, batching several frames per dispatch, and packing work by block size to cut divergence.
+- **Caveat — measured on M5 Pro, not the M1 target.** The whole toolchain is built to run on the M1:
+  the relative GPU-vs-CPU ratio there is the real question. On the smaller M1 GPU, 2,972 threads
+  fills the machine *better* (relatively), and the M1 CPU is weaker, so the GPU's relative advantage
+  may be larger — but this must be measured. Run `/tmp/t1_bench` on the M1.
+
+### Bottom line for the project
+
+For 2K real content the hybrid (CPU keeps a tuned multithreaded T1) is already close; GPU T1 buys a
+modest multiple and, more importantly on the M1, **moves the bottleneck stage off the 4 starved
+P-cores onto the idle GPU** while the back-end (DWT/MCT/level-shift/xyz_to_rgb) also offloads. The
+realistic path to M1 2K realtime: GPU back-end + GPU color first (large, easy), then GPU T1 with
+threadgroup-memory optimization if profiling on the M1 still shows a gap. 4K/HFR will need the
+optimized GPU T1.

@@ -2175,6 +2175,48 @@ static OPJ_BOOL opj_t1_decode_cblk(opj_t1_t *t1,
         }
     }
 
+    /* --- BEGIN metal-jpeg2000 corpus dump (env-gated, prototype only) --- */
+    /* Set OPJ_T1_DUMP=<path> and decode with -threads 1 to emit a self-contained
+     * per-codeblock corpus for the Metal T1 kernel prototype + bit-exact oracle. */
+    {
+        static FILE* s_dump = NULL;
+        static int s_dump_init = 0;
+        if (!s_dump_init) {
+            const char* p = getenv("OPJ_T1_DUMP");
+            if (p) {
+                s_dump = fopen(p, "wb");
+            }
+            s_dump_init = 1;
+        }
+        if (s_dump) {
+            OPJ_UINT32 hdr[7];
+            OPJ_UINT32 segno2;
+            OPJ_UINT32 w = t1->w, h = t1->h;
+            const OPJ_INT32* out = cblk->decoded_data ? cblk->decoded_data : t1->data;
+            hdr[0] = orient;
+            hdr[1] = roishift;
+            hdr[2] = cblksty;
+            hdr[3] = cblk->numbps;
+            hdr[4] = w;
+            hdr[5] = h;
+            hdr[6] = cblk->real_num_segs;
+            fwrite(hdr, sizeof(OPJ_UINT32), 7, s_dump);
+            for (segno2 = 0; segno2 < cblk->real_num_segs; ++segno2) {
+                OPJ_UINT32 seghdr[2];
+                seghdr[0] = cblk->segs[segno2].len;
+                seghdr[1] = cblk->segs[segno2].real_num_passes;
+                fwrite(seghdr, sizeof(OPJ_UINT32), 2, s_dump);
+            }
+            fwrite(&cblkdataindex, sizeof(OPJ_UINT32), 1, s_dump); /* total data bytes */
+            if (cblkdataindex) {
+                fwrite(cblkdata, 1, cblkdataindex, s_dump);
+            }
+            fwrite(out, sizeof(OPJ_INT32), (size_t)w * h, s_dump);  /* oracle */
+            fflush(s_dump);
+        }
+    }
+    /* --- END metal-jpeg2000 corpus dump --- */
+
     /* Restore original t1->data is needed */
     if (cblk->decoded_data) {
         t1->data = original_t1_data;
