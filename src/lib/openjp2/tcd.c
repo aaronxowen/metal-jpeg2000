@@ -1767,6 +1767,48 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
         }
     }
 
+    /* --- metal-jpeg2000 back-end corpus dump: input (post-T1 / pre-iDWT) --- */
+    /* OPJ_BACKEND_DUMP=<path> + -threads 1 emits, per frame: geometry +
+     * per-component params + 3 input float buffers, then (after the full
+     * back-end) the 3 final integer component buffers as the oracle. DCI
+     * whole-tile path only. */
+    static FILE* s_bk = NULL; static int s_bk_init = 0;
+    static OPJ_UINT32 s_bk_w = 0, s_bk_h = 0, s_bk_nc = 0;
+    if (!s_bk_init) {
+        const char* p = getenv("OPJ_BACKEND_DUMP");
+        if (p) { s_bk = fopen(p, "wb"); }
+        s_bk_init = 1;
+    }
+    if (s_bk && p_tcd->whole_tile_decoding) {
+        opj_tcd_tile_t* tile = p_tcd->tcd_image->tiles;
+        OPJ_UINT32 nc = tile->numcomps, c, r;
+        opj_tcd_tilecomp_t* tc0 = &tile->comps[0];
+        OPJ_UINT32 numres = tc0->minimum_num_resolutions;
+        opj_tcd_resolution_t* rr = &tc0->resolutions[numres - 1];
+        OPJ_UINT32 magic = 0x444E4B42; /* 'BKND' */
+        s_bk_w = (OPJ_UINT32)(rr->x1 - rr->x0);
+        s_bk_h = (OPJ_UINT32)(rr->y1 - rr->y0);
+        s_bk_nc = nc;
+        fwrite(&magic, 4, 1, s_bk); fwrite(&nc, 4, 1, s_bk);
+        fwrite(&s_bk_w, 4, 1, s_bk); fwrite(&s_bk_h, 4, 1, s_bk);
+        fwrite(&numres, 4, 1, s_bk);
+        for (r = 0; r < numres; ++r) {
+            OPJ_INT32 box[4] = { tc0->resolutions[r].x0, tc0->resolutions[r].y0,
+                                 tc0->resolutions[r].x1, tc0->resolutions[r].y1 };
+            fwrite(box, 4, 4, s_bk);
+        }
+        for (c = 0; c < nc; ++c) {
+            OPJ_INT32 meta[3] = { (OPJ_INT32)p_tcd->image->comps[c].prec,
+                                  (OPJ_INT32)p_tcd->image->comps[c].sgnd,
+                                  p_tcd->tcp->tccps[c].m_dc_level_shift };
+            fwrite(meta, 4, 3, s_bk);
+        }
+        { OPJ_INT32 mct = (OPJ_INT32)p_tcd->tcp->mct; fwrite(&mct, 4, 1, s_bk); }
+        for (c = 0; c < nc; ++c)
+            fwrite(tile->comps[c].data, sizeof(OPJ_INT32), (size_t)s_bk_w * s_bk_h, s_bk);
+    }
+    /* --- END back-end dump (input) --- */
+
     /*----------------DWT---------------------*/
 
     /* FIXME _ProfStart(PGROUP_DWT); */
@@ -1791,6 +1833,15 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
     }
     /* FIXME _ProfStop(PGROUP_DC_SHIFT); */
 
+    /* --- metal-jpeg2000 back-end corpus dump: output (final integer image oracle) --- */
+    if (s_bk && p_tcd->whole_tile_decoding) {
+        opj_tcd_tile_t* tile = p_tcd->tcd_image->tiles;
+        OPJ_UINT32 c;
+        for (c = 0; c < s_bk_nc; ++c)
+            fwrite(tile->comps[c].data, sizeof(OPJ_INT32), (size_t)s_bk_w * s_bk_h, s_bk);
+        fflush(s_bk);
+    }
+    /* --- END back-end dump (output) --- */
 
     /*---------------TILE-------------------*/
     return OPJ_TRUE;

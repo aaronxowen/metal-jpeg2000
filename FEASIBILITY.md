@@ -456,3 +456,36 @@ gather/scatter, 10 dispatches/frame) **loses to the M5 Pro CPU**. Implications:
 Both GPU stages built so far — **T1 (bit-exact) and inverse DWT (float-exact)** — validate against
 OpenJPEG. The methodology (corpus + oracle + scalar reference + Metal kernel) is proven and reusable
 for the remaining back-end stages (inverse MCT/ICT, level-shift, xyz_to_rgb).
+
+---
+
+## 14. GPU back-end complete: iDWT + inverse ICT + level-shift (integer-exact)
+
+Frame-level corpus dump added to `opj_tcd_decode_tile` (`OPJ_BACKEND_DUMP=<path>`, `-threads 1`):
+per frame it emits geometry + per-component (prec, sgnd, dc_level_shift) + mct flag + the 3 post-T1
+input float buffers, then (after the full back-end) the 3 final integer component buffers (oracle).
+
+- `proto/backend_ref.c` — scalar reference for the whole back-end (iDWT + inverse ICT
+  `r=y+1.402v / g=y−0.34413u−0.71414v / b=y+1.772u` + `clamp(lrintf(v)+dc, lo, hi)`).
+  Integer-exact on 6,470,670 / 6,473,520 samples; 2,850 off-by-1 (scalar iDWT FP-order noise).
+- `proto/backend_kernel.metal` + `proto/backend_bench.swift` — reuses the iDWT H/V kernels, adds a
+  `backend_finalize` kernel (1 thread/pixel: inverse ICT + level-shift + clamp → int). fast-math off.
+
+```
+GPU: Apple M5 Pro  frame 1998x1080, 3 comps, 6 res, mct=1
+samples: 6473520  differ: 0  max |diff|: 0    <- INTEGER-EXACT vs OpenJPEG final image
+GPU full back-end (iDWT+ICT+level-shift): 14.0 ms/frame
+```
+
+### Pipeline status — the whole DCI decode minus Tier-2 is now GPU + exact
+
+| Stage | GPU status | M5 Pro time/frame |
+|---|---|---|
+| Tier-2 (packet parse) | CPU (serial, stays) | small |
+| **Tier-1 (MQ/EBCOT)** | **bit-exact** | 14.7 ms (unopt) |
+| **iDWT + ICT + level-shift** | **integer-exact** | 14.0 ms (unopt) |
+| xyz_to_rgb (display) | not yet (libdcp CPU stage) | — |
+
+Both GPU halves of the codec now reproduce OpenJPEG output exactly. Remaining work is **optimization**
+(threadgroup memory, batching, fused stages) and **measuring on the M1**, plus the separate
+`xyz_to_rgb` color stage (the likely highest-yield easy CPU-relief win, per §13).
