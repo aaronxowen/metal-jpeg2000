@@ -38,7 +38,7 @@ Per-frame time ≈ `max(CPU T1, GPU back-end+color)`, overlapped frame N+1 ‖ f
 | MXF read + AES decrypt | libdcp (CPU) | unchanged; hardware AES, ~negligible |
 | Tier-2 + **Tier-1** | CPU (decode thread) | our opj fork, `opj_set_t1_output_callback`, buffers reused |
 | iDWT + ICT + level-shift | **GPU** | validated batched kernels (integer-exact) |
-| **xyz_to_rgb** | **GPU** (revised from §18) | cheap LUT+matrix; outputs the display RGBA texture directly — no readback. ~few ms, fits the 7 ms margin. Fall back to CPU color only if margin tightens. |
+| **xyz_to_rgb** | **CPU — reuse dcpomatic's Image swscale** (revised again, see note) | the player's displayed color is FFmpeg `sws_scale` XYZ12LE→RGBA inside dcpomatic's `Image` (SWS_BICUBIC|SWS_ACCURATE_RND), NOT libdcp `xyz_to_rgba` and NOT a GPU kernel. DCP content *unsets* the colour conversion; `J2KImageProxy::prepare` only copies XYZ12. So feed the GPU's (integer-exact) XYZ into the same `Image` conversion → RGBA identical to the player, zero color-matching risk, CPU (M1 is GPU-bound). |
 | timing / audio / seek / 3D | Butler | unchanged |
 
 > Revision of §18: with the back-end now ~32 ms on M1 and a 7 ms margin, putting color on the GPU
