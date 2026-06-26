@@ -43,10 +43,13 @@
 #include "opj_common.h"
 
 /* metal-jpeg2000 fork: decode-to-Tier-1 callback state (see openjpeg.h /
- * opj_set_t1_output_callback). Global; single-decode-thread contract. */
-static opj_t1_output_cb opj_gs_t1cb = NULL;
-static void* opj_gs_t1cb_user = NULL;
-static OPJ_BOOL opj_gs_t1cb_skip = OPJ_FALSE;
+ * opj_set_t1_output_callback). THREAD-LOCAL: only the thread that registers the
+ * callback is intercepted, so a host that runs other opj decodes concurrently on
+ * other threads (e.g. dcpomatic's Butler prefetch calling decompress_j2k) is
+ * unaffected and decodes normally. */
+static __thread opj_t1_output_cb opj_gs_t1cb = NULL;
+static __thread void* opj_gs_t1cb_user = NULL;
+static __thread OPJ_BOOL opj_gs_t1cb_skip = OPJ_FALSE;
 void OPJ_CALLCONV opj_set_t1_output_callback(opj_t1_output_cb cb,
         void* user_data, OPJ_BOOL skip_backend)
 {
