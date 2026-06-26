@@ -70,23 +70,28 @@ Implications to plan for (C0):
 
 ## Phased sub-steps
 
-- **C0 — opj linking: option (b)** (decided above). Rebuild libdcp + dcpomatic against the
-  `metal-jpeg2000` opj fork on the build host; swap the prebuilt Engine libs; confirm a DCP still
-  decodes normally and the decode-to-T1 symbol is present.
-- **C1 — expose the codestream.** Add `PlayerVideo::proxy()` getter (1 line) in dcpomatic; add a
-  `PlayerEngine` method returning the decrypted J2K bytes + pts + eyes + reduce + size per frame
-  (dynamic_cast to `J2KImageProxy`; fall back to `.image()` for non-DCP content). Verify by logging
-  codestream sizes and decoding one with our opj.
-- **C2 — Swift hybrid decoder module.** From J2K bytes → RGBA `MTLTexture` (reuse the Phase A
-  kernels + our opj). Validate the texture matches libdcp's `.image(RGBA)` output (off-screen pixel
-  compare) on sample frames — color correctness gate.
-- **C3 — wire into the pipeline.** `FrameQueue` carries pooled `MTLTexture` (not `[UInt8]`);
-  `MetalVideoView` draws a supplied texture (drop the `upload` byte-copy); decode thread overlaps
-  CPU T1 ‖ GPU as in Phase A; honor the parked-on-seek contract. Play a real DCP; **measure sustained
-  fps on the M1** (the number that matters).
+Built + validated in `swift-dcp-player` (branch `feature/metal-hybrid-decode`); full as-built record +
+build/run commands are in that repo's `CLAUDE.md` ("GPU hybrid decode"). Done unless noted.
+
+- **C0 — opj linking: option (b) — DONE.** Engine rebuilt against the fork into a separate
+  `Engine-hybrid/` prefix (shared `Engine/` untouched); `build-engine.sh` LDFLAGS prefix-first +
+  `-lopenjp2` + install_name fixup (fork-guarded); `Package.swift` auto-selects the prefix. DCP still
+  decodes; the decode-to-T1 symbol is reachable in-app (opj 2.5.4). NOTE: built on the macOS-26 host
+  for dev; a macOS-14-floor build must rebuild the fork opj on the VM too (it bakes the host OS).
+- **C1 — expose the codestream — DONE.** `PlayerVideo::proxy()` getter (dcpomatic) + a probe pulling
+  the decrypted `J2KImageProxy::j2k()` in `nextVideoFrame` (`KMQ_HYBRID_PROBE`). Verified live.
+- **C2 — hybrid decoder — DONE (pixel-exact, in-player).** Split CPU/GPU rather than one Swift module:
+  facade `decodeJ2KToT1` (opj memory-stream, **thread-local** decode-to-T1 hook) → `HybridJ2KBackend`
+  (GPU iDWT+MCT+level-shift, **integer-exact** vs opj) → facade `xyzToRGBA` (reuse dcpomatic `Image`
+  swscale, **pixel-exact** vs `nextVideoFrame`). Colour ended up CPU/swscale, not a GPU kernel (see
+  the §xyz_to_rgb note).
+- **C3 — wire into the pipeline — NEXT.** `FrameQueue` carries the hybrid frame (RGBA/texture);
+  `MetalVideoView` draws it; decode thread overlaps CPU T1 ‖ GPU; honor the parked-on-seek contract.
+  Play a real DCP; **measure sustained fps on the M1**. KEY PROBLEM: the hybrid path currently goes
+  through `butler->get_video`, which makes the Butler full-decode every frame on its prefetch thread
+  (double decode) — must avoid that to get the speedup (prepare/prefetch bypass; may touch Layer A).
 - **C4 — finish.** `reduce` (proxy resolution factor → `opj_set_decoded_resolution_factor`; the engine
-  already has `setDecodeReduction`), 3D/eyes (content is StereoVF; 2D playback picks one eye), and
-  GPU color accuracy vs the display colorspace tagging in `MetalVideoView`.
+  already has `setDecodeReduction`), 3D/eyes (content is StereoVF; 2D playback picks one eye).
 
 ## Open questions / risks
 
