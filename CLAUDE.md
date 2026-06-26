@@ -64,4 +64,27 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
 
+---
+
+## Project context (metal-jpeg2000)
+
+**What this repo is:** a fork of [`uclouvain/openjpeg`](https://github.com/uclouvain/openjpeg) (`upstream`) repurposed as a **GPU/Metal JPEG 2000 decode feasibility project** — making realtime DCP playback possible on a low-floor M1 Mac mini. It is *not* greenfield; most of the tree is upstream OpenJPEG. Read these first:
+- `FEASIBILITY.md` — the study (exec summary up top; §17–18 are the most current results).
+- `swift-player-integration-scope.md`, `phase-c-integration-scope.md` — the integration plan.
+- `proto/` — the prototype (per-stage reference C + Metal kernels + benches); see `proto/README.md`.
+
+**Architecture decided:** hybrid decode — CPU runs Tier-2 + Tier-1 (the serial MQ coder, faster on CPU), the GPU runs the back-end (inverse DWT + ICT + level-shift, and color), overlapped across frames via unified memory. GPU Tier-1 was tried and abandoned (slower than CPU).
+
+**Git hygiene:** never `git add -A`. `build/`, `proto/*corpus.bin`, and `tests/test-content/` (~424 MB) are large and gitignored — stage explicit files only.
+
+**Build gotchas (correctness-load-bearing):**
+- Metal benchmarks must compile with **fast-math OFF**; C reference decoders with **`-ffp-contract=off`** — both to match OpenJPEG's non-fused NEON path and stay bit/float-exact.
+- CMake via the official Kitware binary, not Homebrew (the `cirruslabs` tap breaks `brew install`).
+
+**Validation discipline:** every GPU stage is validated **bit-exact (T1) / integer-exact (back-end)** against an OpenJPEG-derived oracle (methodology: instrument opj to dump a corpus + oracle → portable-C reference → Metal kernel → exact compare). Preserve that bar — do not loosen to "looks right".
+
+**Hooks / APIs added by the fork:** env-gated corpus dumps `OPJ_T1_DUMP` / `OPJ_DWT_DUMP` / `OPJ_BACKEND_DUMP` (decode with `-threads 1`); the decode-to-Tier-1 callback `opj_set_t1_output_callback` (`openjpeg.h` / `tcd.c`).
+
+**Performance target is the M1 Mac mini**, not the dev machine — measure there. The GPU benches are self-contained (need only a corpus file + `swiftc`); see `proto/M1_RUNBOOK.md`. Cross-machine results land in `proto/M1_RESULTS.md` via the branch on origin.
+
 
