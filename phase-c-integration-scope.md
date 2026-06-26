@@ -85,11 +85,24 @@ build/run commands are in that repo's `CLAUDE.md` ("GPU hybrid decode"). Done un
   (GPU iDWT+MCT+level-shift, **integer-exact** vs opj) → facade `xyzToRGBA` (reuse dcpomatic `Image`
   swscale, **pixel-exact** vs `nextVideoFrame`). Colour ended up CPU/swscale, not a GPU kernel (see
   the §xyz_to_rgb note).
-- **C3 — wire into the pipeline — NEXT.** `FrameQueue` carries the hybrid frame (RGBA/texture);
-  `MetalVideoView` draws it; decode thread overlaps CPU T1 ‖ GPU; honor the parked-on-seek contract.
-  Play a real DCP; **measure sustained fps on the M1**. KEY PROBLEM: the hybrid path currently goes
-  through `butler->get_video`, which makes the Butler full-decode every frame on its prefetch thread
-  (double decode) — must avoid that to get the speedup (prepare/prefetch bypass; may touch Layer A).
+- **C3.0 — kill the double-decode — DONE.** Added a trailing `no_prepare` flag to dcpomatic's
+  `Butler` ctor (3rd approved Layer A exception; default false so all other callers are unaffected)
+  that gates the prefetch `prepare` post in `Butler::video()`. With `KMQ_HYBRID=1` the facade builds
+  the DCP Butler with `no_prepare=true`, so the prefetch threads no longer `decompress_j2k` — the
+  Butler is a pure timing/sequencing source and we decode via GPU. FFmpeg media keeps `no_prepare=false`.
+- **C3.1 — wire into the worker (sequential) — DONE.** `DecodeWorker` branches on `hybridEnabled()`;
+  per frame: `nextVideoFrameT1` (CPU T1 via the no-prepare Butler) → `HybridJ2KBackend` GPU back-end
+  → `xyzToRGBA` swscale → `FrameQueue`. `testHybridWorkerPipeline` confirms frame 0 is **pixel-exact**
+  vs the normal path (0/6.47M) through the live queue.
+- **C3.2 — parallel pipeline — DONE (correctness; M1 fps pending on-device).** `HybridPipeline`
+  (Playback): a **Tier-1 worker pool** (K threads; reentrant `decodeBytesToT1Owned` — own buffers,
+  thread-local opj hook) feeding a **single serial GPU stage** (consumes by sequence → ordered) →
+  a **colour thread** (swscale) → `FrameQueue`. Overlaps T1 ‖ GPU ‖ colour so the GPU (~37 ms on M1)
+  is the ceiling, not the sum. Backpressure bounds Tier-1 buffers in flight (`window = K+2`);
+  `get_video` serialised under a lock (single-consumer contract); `stop()` parks + joins all threads
+  (seek contract). K overridable via `KMQ_HYBRID_T1`. Soak test: 120 frames, ordering held, no
+  deadlock; **dev-host throughput 57.7 fps** (M1's GPU-bound ceiling is lower — measure on-device).
+  **NEXT: measure sustained fps on the M1** + wire into live `MetalVideoView` playback end to end.
 - **C4 — finish.** `reduce` (proxy resolution factor → `opj_set_decoded_resolution_factor`; the engine
   already has `setDecodeReduction`), 3D/eyes (content is StereoVF; 2D playback picks one eye).
 
