@@ -126,6 +126,23 @@ Report the `OPTIMIZED GPU back-end` ms/frame and compare to the earlier `/tmp/ba
 (M1 was ~38.5 ms; M5 Pro went 14.1 → 8.4 ms, ~1.7×). On the M1 the back-end was the binding stage, so
 this drop should widen the hybrid's margin substantially.
 
+### Threadgroup-memory back-end (FEASIBILITY §18 follow-up) — the M1's fix, measure it here
+`proto/phase_a/backend_tg.metal` moves the DWT lifting scratch from device memory (`Wpool`) into
+**threadgroup memory** — one threadgroup per line, DRAM touched only at gather/scatter. This targets
+the bandwidth bound that made the M1 gain only 1.18× from component-batching, so it should help the
+M1 the most. Same integer-exact bar (the bench validates vs the oracle).
+```sh
+swiftc -O proto/phase_a/backend_tg_bench.swift -o /tmp/backend_tg_bench -framework Metal -framework Foundation
+/tmp/backend_tg_bench proto/backend_corpus.bin proto/phase_a/backend_tg.metal 256
+# Optional: sweep the threads-per-line-threadgroup arg — report the best.
+for T in 64 128 256 512; do /tmp/backend_tg_bench proto/backend_corpus.bin proto/phase_a/backend_tg.metal $T | tail -1; done
+```
+Report `THREADGROUP GPU back-end` ms/frame vs the `OPTIMIZED` number above, and the best `T`.
+(M5 Pro reference: 8.08 → 1.30 ms at T=256, ~6×, integer-exact. M1 expectation: the 32.5 ms
+optimized kernel should drop by a large factor — this is the number that says how much hybrid
+headroom the M1 now has.) The same kernels ship in `swift-dcp-player`'s `HybridJ2KBackend`
+(tgThreads=256; `KMQ_HYBRID_TG=0` reverts to the old kernels for in-app A/B).
+
 ## Regenerating corpora (only if the corpus files are missing)
 The corpora are derived from one real DCI 2K frame via env-gated dumps in the (committed) instrumented
 OpenJPEG. This requires building OpenJPEG (CMake + libpng/libtiff/lcms2) and a `.j2c` test frame —
