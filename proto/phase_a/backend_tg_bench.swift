@@ -36,7 +36,7 @@ for c in 0..<nc { for i in 0..<n { inAll[c*n + i] = Float(bitPattern: u32(off + 
 var oracle = [Int32](repeating: 0, count: nc*n)
 for c in 0..<nc { for i in 0..<n { oracle[c*n + i] = i32(off + 4*i) }; off += 4*n }
 
-guard let dev = MTLCreateSystemDefaultDevice() else { die("no device") }
+guard let dev = MTLCopyAllDevices().first else { die("no device") }
 print("GPU: \(dev.name)  \(w)x\(h), \(nc) comps, \(numres) res, mct=\(mct)  [THREADGROUP back-end, T=\(tgThreads)]")
 guard let ksrc = try? String(contentsOfFile: kernelPath, encoding: .utf8) else { die("read kernel") }
 let opts = MTLCompileOptions(); opts.fastMathEnabled = false

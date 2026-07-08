@@ -132,3 +132,20 @@ Component-batching optimization applied to the GPU back-end kernel. 120-frame ru
 | Margin | **7.0 ms** (vs 0.3 ms before) |
 
 The back-end optimization adds 7.0 ms of margin over the 41.6 ms budget, up from 0.3 ms. The pipeline is now comfortably GPU-bound at 33.9 ms with CPU T1 idle for ~14 ms of each frame interval.
+
+---
+
+## Phase A threadgroup back-end sweep (M1) — 2026-07-07
+
+Threadgroup-memory kernel (`backend_tg.metal`) — one threadgroup per DWT line, lifting scratch in threadgroup memory, no device-memory Wpool. Swept `threadsPerGroup` across 64/128/256/512. All runs INTEGER-EXACT vs oracle ✓.
+
+| threadsPerGroup | ms/frame | vs backend_opt (32.502 ms) |
+|---|---|---|
+| 64  | 5.174 ms | 6.29× faster |
+| 128 | 4.269 ms | 7.62× faster |
+| **256** | **4.229 ms** | **7.69× faster** ← best |
+| 512 | 4.637 ms | 7.01× faster |
+
+Best: **T=256, 4.229 ms/frame** — a 7.7× improvement over the previous optimized kernel.
+
+This drops the GPU back-end far below CPU T1 (~19 ms), flipping the bottleneck from GPU-bound to **CPU-bound**. The new theoretical overlapped ceiling is `max(19, 4.2)` ≈ **19 ms/frame (~52 fps)** — well inside the 41.6 ms 2K@24fps budget with ~22 ms of margin. The hybrid harness needs re-running with `backend_tg.metal` to confirm the end-to-end number.
